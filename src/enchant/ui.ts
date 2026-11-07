@@ -122,16 +122,17 @@ function canGoNext(): boolean {
     return true;
 }
 
-export async function renderEnchantPage(): Promise<void> {
-    const app = document.querySelector<HTMLDivElement>('#app')!;
+// host 를 주면 계산기 탭 안에 넣어 그리고(홈 버튼 없음), 없으면 예전처럼 페이지 전체를 그린다.
+export async function renderEnchantPage(host?: HTMLElement): Promise<void> {
+    const target = host ?? document.querySelector<HTMLDivElement>('#app')!;
     state = createInitialState();
 
-    app.innerHTML = `
-    <div class="nav-bar">
+    target.innerHTML = `
+    ${host ? '' : `<div class="nav-bar">
       <button class="btn-home" id="back-home">🏠 Home</button>
       <h2 style="margin:0 0 0 15px; border:none;">🧪 옵션부여 계산기</h2>
-    </div>
-    <div class="container">
+    </div>`}
+    <div class="${host ? 'enc-embedded' : 'container'}">
       <div class="enc-step-indicator" id="enc-step-indicator"></div>
       <div id="enc-body"></div>
       <div class="enc-nav-row">

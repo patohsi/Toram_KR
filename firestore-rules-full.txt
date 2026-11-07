@@ -124,13 +124,13 @@ service cloud.firestore {
     // ===== 방문 통계 (stats_daily: 하루, stats_monthly: 한 달) =====
     // 누구나 읽을 수 있고, 쓰기는 "+1씩 올리는 요청"만 허용한다. 값을 바꾸거나 지우는 요청은 거절.
     function statPageKeysOk(p) {
-      return p.keys().hasOnly(['home', 'schedule', 'crysta', 'skill', 'ability', 'registlet', 'food', 'equip', 'guide', 'info', 'enchant', 'trade']);
+      return p.keys().hasOnly(['home', 'schedule', 'crysta', 'skill', 'ability', 'registlet', 'food', 'equip', 'guide', 'info', 'enchant', 'trade', 'boss', 'consumable', 'calculator']);
     }
 
     function statPageTotal(p) {
       return p.get('home', 0) + p.get('schedule', 0) + p.get('crysta', 0) + p.get('skill', 0)
         + p.get('ability', 0) + p.get('registlet', 0) + p.get('food', 0) + p.get('equip', 0)
-        + p.get('guide', 0) + p.get('info', 0) + p.get('enchant', 0) + p.get('trade', 0);
+        + p.get('guide', 0) + p.get('info', 0) + p.get('enchant', 0) + p.get('trade', 0) + p.get('boss', 0) + p.get('consumable', 0) + p.get('calculator', 0);
     }
 
     function statOnePage(p) {

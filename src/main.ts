@@ -2,14 +2,16 @@
 import './style.css';
 import { db } from './firebase';
 import { collection, getDocs, query, orderBy, serverTimestamp, where, deleteDoc, doc, addDoc, limit } from 'firebase/firestore';
-import { renderEnchantPage } from './enchant/ui';
+import { renderCalculatorPage } from './calculator/ui';
 import { renderTradePage } from './trade/ui';
+import { renderBossPage } from './boss/ui';
+import { renderConsumablePage } from './consumable/ui';
 import { recordPageView, loadVisitSummary, type VisitSummary } from './stats';
 
 // =================================================
 // 0. 타입 및 라우팅
 // =================================================
-type PageKey = 'home' | 'schedule' | 'crysta' | 'skill' | 'ability' | 'registlet' | 'food' | 'equip' | 'guide' | 'info' | 'enchant' | 'trade';
+type PageKey = 'home' | 'schedule' | 'crysta' | 'skill' | 'ability' | 'registlet' | 'food' | 'equip' | 'guide' | 'info' | 'enchant' | 'trade' | 'boss' | 'consumable' | 'calculator';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
 
@@ -24,13 +26,16 @@ const routes: Record<PageKey, () => void> = {
     equip: renderEquipmentPage,
     guide: renderGuidePage,
     info: renderInfoPage,
-    enchant: renderEnchantPage,
-    trade: renderTradePage
+    enchant: () => renderCalculatorPage('enchant'),
+    trade: renderTradePage,
+    boss: renderBossPage,
+    consumable: renderConsumablePage,
+    calculator: () => renderCalculatorPage()
 };
 
 const PAGE_NAMES: Record<string, string> = {
     home:'홈', crysta:'크리스타', skill:'스킬', ability:'어빌리티',
-    registlet:'레지스트릿', food:'요리', equip:'장비', guide:'뉴비가이드', schedule:'이벤트', enchant:'옵션부여 계산기', trade:'거래'
+    registlet:'레지스트릿', food:'요리', equip:'장비', guide:'뉴비가이드', schedule:'이벤트', enchant:'옵션부여', calculator:'계산기', trade:'거래', boss:'보스', consumable:'소모품'
 };
 
 function navigate(page: PageKey) {
@@ -89,10 +94,11 @@ const HOME_SHORTCUTS: { page: PageKey; icon: string; label: string }[] = [
     { page: 'registlet', icon: '💍', label: '레지스트릿' },
     { page: 'food', icon: '🍳', label: '요리' },
     { page: 'equip', icon: '🛡️', label: '장비' },
+    { page: 'boss', icon: '👹', label: '보스' },
     { page: 'guide', icon: '📘', label: '뉴비가이드' },
     { page: 'trade', icon: '🏪', label: '거래' },
-    { page: 'enchant', icon: '🧪', label: '옵션부여 계산기' },
-    { page: 'info', icon: '⭐', label: '참가자' },
+    { page: 'calculator', icon: '🧮', label: '계산기' },
+    { page: 'consumable', icon: '💊', label: '소모품' },
 ];
 
 const QUICK_SEARCH_TARGETS: { key: string; label: string; placeholder: string }[] = [
@@ -730,6 +736,7 @@ const skillFileMap: Record<string, Record<string, string>> = {
         '네크로맨서': 'skills_Necromancer',
         '민스트럴': 'skills_minstrel',
         '댄서': 'skills_dancer',
+        '골렘': 'skills_golem',
         '다크파워': 'skills_darkpower',
         '매직블레이드': 'skills_magicblade',
         '베어핸드': 'skills_barehand',
@@ -2596,6 +2603,7 @@ function renderInfoPage() {
 
 // 1. 마우스 백버튼 감지 시작
 initMouseBackEvent();
+document.getElementById('site-foot-info')?.addEventListener('click', () => navigate('info'));
 
 // 2. 테마 및 탑버튼 초기화
 initGlobalFeatures();

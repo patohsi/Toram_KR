@@ -33,7 +33,7 @@
         },
         {
             category: "대장간/드랍",
-            name: "충후한 나이프",
+            name: "중후한 나이프",
             name_en: "Heavy Knife",
             atk: 17,
             stats: ["크리티컬률+5", "STR+3", "명중-3"],
@@ -57,7 +57,7 @@
         },
         {
             category: "대장간/드랍",
-            name: "무쉬 나이프",
+            name: "부쉬 나이프",
             name_en: "Bush Knife",
             atk: 54,
             stats: ["무기 ATK+10", "물리관통+6%", "공격속도-2%"],
@@ -191,7 +191,7 @@
         },
         {
             category: "필드/보스",
-            name: "어스름의 단검",
+            name: "어스름의 단도",
             name_en: "Twilight Dagger",
             atk: 10,
             stats: ["공격속도+10%", "시전속도+10%", "물리추격 10%", "마법추격 10%"],
@@ -338,7 +338,7 @@
         },
         {
             category: "한정/이벤트",
-            name: "우드초코 단검",
+            name: "우드 쵸코 단검",
             name_en: "Wood Choco Dagger",
             atk: 83,
             stats: ["최대 MP+400", "Avoid 회복+4%", "공격 MP 회복+4"],

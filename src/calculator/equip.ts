@@ -68,6 +68,13 @@ export async function loadCategory(cat: string): Promise<EquipItem[]> {
     return cache[cat];
 }
 
+// 카테고리의 대표 이미지(이미지가 있는 첫 장비). 옵션부여 화면의 장비 종류 아이콘에 쓴다.
+export async function categoryIcon(cat: string): Promise<string> {
+    const list = await loadCategory(cat);
+    const it = list.find(i => (Array.isArray(i.image) ? i.image.length : i.image));
+    return it ? imageOf(cat, it) : '';
+}
+
 // 저장용 키: 카테고리|이름|영문 이름
 export function itemKey(cat: string, item: EquipItem): string {
     return `${cat}|${item.name}|${item.name_en ?? ''}`;

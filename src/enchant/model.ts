@@ -52,8 +52,8 @@ export interface CharacterSettings {
 export function defaultCharacterSettings(): CharacterSettings {
     return {
         level: 320,
-        smithLevel: 0,
-        materialSkillLevels: [0, 0, 0, 0, 0, 0],
+        smithLevel: 100,
+        materialSkillLevels: [10, 10, 10, 10, 10, 10],
         materialAnvilSkillLevelSum: 40,
         hasExpertsCustomization2Skill: true,
     };
@@ -158,6 +158,11 @@ export class StatItem {
             max: Math.min(baseMax + extraMax, hardCap),
             min: Math.max(baseMin + extraMin, -hardCap),
         };
+    }
+
+    /** 최대값이 1인 능력(속성 부여 등)은 수치를 올리는 게 아니라 켜고 끄는 항목이라 숫자를 표시하지 않는다. */
+    isToggle(type: StatValueType): boolean {
+        return this.typeParams(type).limit === 1;
     }
 
     getConvertThreshold(type: StatValueType): number {
@@ -298,6 +303,7 @@ export class EnchantStat {
 
     /** 이 능력의 라벨을, 실제 stat.value가 아니라 주어진 value로 표시한다 (스텝별 분할 표시용). */
     showValueLabel(value: number): string {
+        if (this.item.isToggle(this.type)) return this.item.name;
         const percent = this.type === 'multiplier' ? '%' : '';
         const sign = value > 0 ? '+' : '';
         return `${this.item.name}${percent} ${sign}${value}${percent}`;

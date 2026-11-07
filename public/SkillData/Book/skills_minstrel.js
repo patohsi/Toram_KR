@@ -172,6 +172,33 @@ const minstrelTree = {
         [효과]
         - 아군 받는 피해감소: [(0.5 + 스킬렙^2/50) × 스택]%
       `
+        },
+        {
+            id: "beat_blast",
+            name: "비트 블래스트",
+            name_en: "Beat Blast",
+            tier: 2,
+            type: "Active",
+            prereq: "life_song",
+            description: ``
+        },
+        {
+            id: "sound_veil",
+            name: "사운드 베일",
+            name_en: "Sound Veil",
+            tier: 3,
+            type: "Passive",
+            prereq: "beat_blast",
+            description: ``
+        },
+        {
+            id: "battle_anthem",
+            name: "배틀 노트",
+            name_en: "Battle Anthem",
+            tier: 3,
+            type: "Passive",
+            prereq: "beat_blast",
+            description: ``
         }
     ]
 };

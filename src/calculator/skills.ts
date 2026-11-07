@@ -91,8 +91,7 @@ export async function renderSkillTab(body: HTMLElement, build: Build, save: () =
             <span class="sk2-steps" id="sk2-steps">
               ${[1, 5, 10].map(n => `<button type="button" class="sk2-step ${n === step ? 'on' : ''}" data-step="${n}" title="클릭 한 번에 ${n}씩">${n}</button>`).join('')}
             </span>
-            <button type="button" class="calc-max" id="sk2-save">저장</button>
-            <button type="button" class="calc-max" id="sk2-load">불러오기</button>
+            <button type="button" class="calc-max" id="sk2-save" title="투자한 트리를 한 장의 JPG로 저장">저장 (JPG)</button>
             <button type="button" class="calc-max sk2-danger" id="sk2-reset">초기화</button>
             <small class="calc-dim">이 기기에 자동 저장</small>
           </div>
@@ -242,35 +241,135 @@ export async function renderSkillTab(body: HTMLElement, build: Build, save: () =
         renderAll();
     });
 
-    // 저장/불러오기: 투자 상태를 글자(JSON)로 복사하고 붙여 넣어 되돌린다
-    document.getElementById('sk2-save')!.addEventListener('click', async () => {
-        const text = JSON.stringify(build.skills);
-        try {
-            await navigator.clipboard.writeText(text);
-            alert('스킬 투자 상태를 복사했습니다. 메모장 등에 붙여 넣어 보관하세요.');
-        } catch {
-            prompt('아래 내용을 복사해 보관하세요.', text);
-        }
-    });
-    document.getElementById('sk2-load')!.addEventListener('click', () => {
-        const text = prompt('저장해 둔 스킬 투자 내용을 붙여 넣으세요.');
-        if (!text) return;
-        try {
-            const parsed = JSON.parse(text) as Record<string, Record<string, number>>;
-            const next: Record<string, Record<string, number>> = {};
-            for (const t of d.trees) {
-                for (const s of t.skills) {
-                    const v = Math.trunc(Number(parsed?.[t.id]?.[s.id]));
-                    if (Number.isFinite(v) && v > 0) (next[t.id] ??= {})[s.id] = Math.min(MAX, v);
-                }
+    // 저장: 투자한 트리를 한 장의 JPG로 합쳐 내려받는다
+    document.getElementById('sk2-save')!.addEventListener('click', () => void saveAsJpg());
+
+    async function saveAsJpg(): Promise<void> {
+        const trees = d!.trees.filter(t => treeSpent(build, t) > 0);
+        if (!trees.length) { alert('투자한 스킬이 없습니다.'); return; }
+
+        const srcs = [...new Set(trees.flatMap(t => t.skills.map(sk => sk.img)).filter(Boolean))];
+        const loaded = new Map<string, HTMLImageElement>();
+        await Promise.all(srcs.map(src => new Promise<void>(resolve => {
+            const img = new Image();
+            img.onload = () => { loaded.set(src, img); resolve(); };
+            img.onerror = () => resolve();
+            img.src = src;
+        })));
+
+        const size = (t: Tree): { w: number; h: number } => ({
+            w: (Math.max(...t.skills.map(sk => sk.g[0])) + 1) * CELL_W + PAD * 2,
+            h: (Math.max(...t.skills.map(sk => sk.g[1])) + 1) * CELL_H + PAD * 2 + 28,
+        });
+        const MARGIN = 20, HEAD = 64, TITLE = 40, GAP = 18;
+        const width = Math.max(560, ...trees.map(t => size(t).w)) + MARGIN * 2;
+        const height = HEAD + trees.reduce((sum, t) => sum + TITLE + size(t).h + GAP, 0) + 12;
+
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d')!;
+        const FONT = '"Pretendard","Malgun Gothic","Apple SD Gothic Neo",sans-serif';
+        ctx.fillStyle = '#2b2e36';
+        ctx.fillRect(0, 0, width, height);
+
+        const total = trees.reduce((sum, t) => sum + treeSpent(build, t), 0);
+        ctx.fillStyle = '#ffffff';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'alphabetic';
+        ctx.font = `bold 22px ${FONT}`;
+        ctx.fillText('스킬 투자', MARGIN, 38);
+        ctx.font = `14px ${FONT}`;
+        ctx.fillStyle = '#c9ccd8';
+        ctx.fillText(`총 ${total}포인트 · ${trees.length}개 트리`, MARGIN, 58);
+
+        const wrap = (text: string, maxW: number): string[] => {
+            const lines: string[] = [];
+            let cur = '';
+            for (const ch of text) {
+                if (ctx.measureText(cur + ch).width > maxW && cur) { lines.push(cur); cur = ch; } else cur += ch;
             }
-            build.skills = next;
-            save();
-            renderAll();
-        } catch {
-            alert('붙여 넣은 내용을 읽을 수 없습니다.');
+            if (cur) lines.push(cur);
+            return lines.slice(0, 2);
+        };
+
+        let y = HEAD;
+        for (const t of trees) {
+            const { w, h } = size(t);
+            ctx.textAlign = 'left';
+            ctx.fillStyle = '#ffffff';
+            ctx.font = `bold 16px ${FONT}`;
+            ctx.fillText(`${t.name}  (${treeSpent(build, t)}/${treeMax(t)})`, MARGIN, y + 26);
+            const ox = MARGIN, oy = y + TITLE;
+
+            ctx.fillStyle = '#23262d';
+            ctx.fillRect(ox, oy, w, h);
+
+            const cx = (sk: Skill): number => ox + PAD + sk.g[0] * CELL_W + CELL_W / 2;
+            const cy = (sk: Skill): number => oy + PAD + sk.g[1] * CELL_H + NODE / 2;
+
+            for (const sk of t.skills) {
+                const p = sk.pre ? t.skills.find(x => x.id === sk.pre) : undefined;
+                if (!p) continue;
+                const mid = cx(p) + (cx(sk) - cx(p)) / 2;
+                ctx.strokeStyle = levelOf(build, t, sk.id) > 0 ? '#b9b2f5' : '#5b5f72';
+                ctx.lineWidth = 2.5;
+                ctx.beginPath();
+                ctx.moveTo(cx(p), cy(p));
+                ctx.lineTo(mid, cy(p));
+                ctx.lineTo(mid, cy(sk));
+                ctx.lineTo(cx(sk), cy(sk));
+                ctx.stroke();
+            }
+
+            for (const sk of t.skills) {
+                const lv = levelOf(build, t, sk.id);
+                const x = cx(sk), yy = cy(sk), r = NODE / 2;
+                ctx.save();
+                ctx.beginPath();
+                ctx.arc(x, yy, r, 0, Math.PI * 2);
+                ctx.clip();
+                ctx.fillStyle = '#1d2230';
+                ctx.fillRect(x - r, yy - r, NODE, NODE);
+                const img = loaded.get(sk.img);
+                if (img) {
+                    if (!lv) ctx.filter = 'grayscale(0.85) brightness(0.8)';
+                    ctx.drawImage(img, x - r, yy - r, NODE, NODE);
+                    ctx.filter = 'none';
+                }
+                ctx.restore();
+                ctx.beginPath();
+                ctx.arc(x, yy, r - 1, 0, Math.PI * 2);
+                ctx.lineWidth = 2;
+                ctx.strokeStyle = lv >= MAX ? '#ffd36b' : lv ? '#6fb3ff' : '#3d6fb0';
+                ctx.stroke();
+
+                ctx.textAlign = 'center';
+                ctx.font = `bold 11px ${FONT}`;
+                const label = `Lv ${lv}/${MAX}`;
+                const lw = ctx.measureText(label).width + 12;
+                ctx.fillStyle = lv ? '#e6e2ff' : '#444857';
+                ctx.fillRect(x - lw / 2, yy + r + 3, lw, 15);
+                ctx.fillStyle = lv ? '#3a3470' : '#c9ccd8';
+                ctx.fillText(label, x, yy + r + 14);
+                ctx.fillStyle = '#e9ebf3';
+                ctx.font = `11px ${FONT}`;
+                wrap(sk.n, CELL_W - 6).forEach((line, i) => ctx.fillText(line, x, yy + r + 28 + i * 12));
+            }
+            y += TITLE + h + GAP;
         }
-    });
+
+        const blob: Blob | null = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.92));
+        if (!blob) { alert('이미지를 만들지 못했습니다.'); return; }
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'toram-skills.jpg';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+    }
 
     renderAll();
 }

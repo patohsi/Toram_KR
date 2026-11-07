@@ -22,13 +22,11 @@ import {
 } from './optimizer';
 import type { EnchantCatalog } from './model';
 
-type StepId = 'equipment' | 'positive' | 'negative' | 'result';
 type NegativeMode = 'manual' | 'auto';
 type AutoGoal = 'successRate' | 'material';
 type OrderMode = 'auto' | 'manual';
 
 interface EnchantState {
-    step: StepId;
     fieldType: EquipmentFieldType;
     isOriginalElement: boolean;
     originalPotential: number;
@@ -39,7 +37,8 @@ interface EnchantState {
     positiveAutoFill: boolean;
     negativeMode: NegativeMode;
     negativeAutoGoal: AutoGoal;
-    negativeAutoCount: number | null; // null = 남은 슬롯 전부
+    negativeAutoCountOn: boolean; // 꺼져 있으면(기본) 남은 슬롯을 항상 최대로 채운다
+    negativeAutoCount: number | null;
     negativeStatsManual: EnchantStat[];
     result: EnchantResult | null;
     resolvedPotential: number | null;
@@ -48,12 +47,15 @@ interface EnchantState {
     manualCustomAmount: Record<string, string>; // statKey -> 커스텀 수치 입력값
 }
 
+let skillsOpen = false;
+// 자동화 상자는 평소에 접어 두고, 눌렀을 때만 펼친다
+let autoOpen = false;
+
 let catalog: EnchantCatalog | null = null;
 let state: EnchantState = createInitialState();
 
 function createInitialState(): EnchantState {
     return {
-        step: 'equipment',
         fieldType: 'mainWeapon',
         isOriginalElement: false,
         originalPotential: 90,
@@ -61,9 +63,10 @@ function createInitialState(): EnchantState {
         settings: defaultCharacterSettings(),
         showAdvanced: false,
         positiveStats: [],
-        positiveAutoFill: true,
+        positiveAutoFill: true, // 정옵션을 고르면 상한값이 항상 자동으로 채워진다
         negativeMode: 'auto',
         negativeAutoGoal: 'successRate',
+        negativeAutoCountOn: false,
         negativeAutoCount: null,
         negativeStatsManual: [],
         result: null,
@@ -74,14 +77,6 @@ function createInitialState(): EnchantState {
     };
 }
 
-const STEP_ORDER: StepId[] = ['equipment', 'positive', 'negative', 'result'];
-const STEP_LABEL: Record<StepId, string> = {
-    equipment: '장비 선택',
-    positive: '정옵션(플러스)',
-    negative: '마이너스옵션',
-    result: '결과',
-};
-
 function negativeStats(): EnchantStat[] {
     if (state.negativeMode === 'auto') {
         return computeAutoNegativeStats();
@@ -89,66 +84,95 @@ function negativeStats(): EnchantStat[] {
     return state.negativeStatsManual;
 }
 
+// 같은 입력이면 다시 계산하지 않는다 (한 번 그릴 때 여러 번 불리고, 후보 교체 계산이 무겁다)
+let autoNegativeCache: { key: string; value: EnchantStat[] } | null = null;
+
 function computeAutoNegativeStats(): EnchantStat[] {
     if (!catalog) return [];
-    const usedKeys = new Set(state.positiveStats.map(s => s.statKey));
-    const count = state.negativeAutoCount ?? MAX_ABILITY_LINES - state.positiveStats.length;
+    const potential = state.autoFindPotential ? null : state.originalPotential;
+    const key = JSON.stringify([
+        state.fieldType, state.isOriginalElement, state.settings, potential, state.negativeAutoGoal, state.negativeAutoCountOn, state.negativeAutoCount,
+        state.positiveStats.map(st => `${st.statKey}=${st.value}`),
+    ]);
+    if (autoNegativeCache?.key === key) return autoNegativeCache.value;
+
+    const usedKeys = new Set(state.positiveStats.map(st => st.statKey));
     const candidates: { item: StatItem; type: StatValueType }[] = [];
     catalog.availableCategories(state.fieldType).forEach(cat => {
         cat.items.forEach(item => {
             (['constant', 'multiplier'] as StatValueType[]).forEach(type => {
                 if (type === 'multiplier' && !item.hasMultiplier) return;
-                const key = `${item.id}:${type}`;
-                if (usedKeys.has(key)) return;
+                if (usedKeys.has(`${item.id}:${type}`)) return;
+                if (item.isToggle(type)) return; // 속성 부여처럼 켜고 끄는 항목은 마이너스로 쓸 수 없다
                 const { min } = item.getLimit(type, state.fieldType, state.isOriginalElement, state.settings.level);
                 if (min >= 0) return;
                 candidates.push({ item, type });
             });
         });
     });
-    return autoSelectNegativeStats({
+    // 개수 지정이 꺼져 있으면 남은 슬롯을 최대로 채운다
+    const slots = MAX_ABILITY_LINES - state.positiveStats.length;
+    const value = autoSelectNegativeStats({
         candidates,
-        count: Math.max(0, Math.min(count, MAX_ABILITY_LINES - state.positiveStats.length)),
+        count: Math.max(0, state.negativeAutoCountOn ? Math.min(state.negativeAutoCount ?? slots, slots) : slots),
         mode: state.negativeAutoGoal,
         fieldType: state.fieldType,
         isOriginalElement: state.isOriginalElement,
         level: state.settings.level,
         settings: state.settings,
+        positiveStats: state.positiveStats,
+        originalPotential: potential,
     });
-}
-
-function canGoNext(): boolean {
-    if (state.step === 'positive') return state.positiveStats.length > 0;
-    return true;
+    autoNegativeCache = { key, value };
+    return value;
 }
 
 // host 를 주면 계산기 탭 안에 넣어 그리고(홈 버튼 없음), 없으면 예전처럼 페이지 전체를 그린다.
+// 한 화면 시뮬레이터: 장비·설정 / 정옵션 / 마이너스(자동화) / 결과를 동시에 보여 주고, 입력이 바뀌면 결과를 바로 다시 계산한다.
 export async function renderEnchantPage(host?: HTMLElement): Promise<void> {
     const target = host ?? document.querySelector<HTMLDivElement>('#app')!;
     state = createInitialState();
+    lastSignature = '';
 
     target.innerHTML = `
     ${host ? '' : `<div class="nav-bar">
       <button class="btn-home" id="back-home">🏠 Home</button>
-      <h2 style="margin:0 0 0 15px; border:none;">🧪 옵션부여 계산기</h2>
+      <h2 style="margin:0 0 0 15px; border:none;">🧪 옵션부여 시뮬레이터</h2>
     </div>`}
-    <div class="${host ? 'enc-embedded' : 'container'}">
-      <div class="enc-step-indicator" id="enc-step-indicator"></div>
-      <div id="enc-body"></div>
-      <div class="enc-nav-row">
-        <button class="enc-btn-circle" id="enc-prev" aria-label="이전 단계" title="이전 단계">‹</button>
-        <button class="enc-btn enc-btn-ghost" id="enc-reset">초기화</button>
-        <button class="enc-btn-circle enc-btn-circle-primary" id="enc-next" aria-label="다음 단계" title="다음 단계">›</button>
+    <div class="${host ? 'enc-embedded' : 'container'} enc-plaza">
+      <div class="pz-head">
+        <h3>옵션부여 시뮬레이터</h3>
+        <div class="pz-head-actions">
+          <button type="button" class="pz-btn" id="enc-reset">새로 시작</button>
+        </div>
+      </div>
+      <div class="pz-layout">
+        <section class="pz-center">
+          <div id="enc-sec-equip"></div>
+          <div id="enc-sec-result"></div>
+        </section>
+        <aside class="pz-right">
+          <div id="enc-sec-positive"></div>
+          <div class="pz-auto">
+            <div class="pz-auto-tag">자동화 · 추가 기능</div>
+            <div id="enc-sec-negative"></div>
+          </div>
+        </aside>
       </div>
     </div>
   `;
 
     document.getElementById('back-home')?.addEventListener('click', () => history.back());
+    document.getElementById('enc-reset')!.addEventListener('click', () => {
+        state = createInitialState();
+        lastSignature = '';
+        rerender();
+    });
 
     try {
         catalog = await loadEnchantCatalog();
     } catch {
-        document.getElementById('enc-body')!.innerHTML =
+        document.getElementById('enc-sec-equip')!.innerHTML =
             '<div class="enc-card enc-error">옵션부여 데이터를 불러오지 못했습니다. 잠시 후 다시 시도해주세요.</div>';
         return;
     }
@@ -156,52 +180,62 @@ export async function renderEnchantPage(host?: HTMLElement): Promise<void> {
     rerender();
 }
 
+// 입력이 바뀌었는지 판단하는 값. 같으면 직접 순서 조정 같은 결과 쪽 상태를 그대로 둔다.
+let lastSignature = '';
+
+function inputSignature(): string {
+    const stat = (s: EnchantStat): string => `${s.statKey}=${s.value}`;
+    return JSON.stringify([
+        state.fieldType, state.isOriginalElement, state.originalPotential, state.autoFindPotential, state.settings,
+        state.positiveStats.map(stat), state.positiveAutoFill,
+        state.negativeMode, state.negativeAutoGoal, state.negativeAutoCountOn, state.negativeAutoCount, state.negativeStatsManual.map(stat),
+    ]);
+}
+
 function rerender(): void {
-    renderStepIndicator();
-    renderBody();
-    renderNavButtons();
-}
-
-function renderStepIndicator(): void {
-    const el = document.getElementById('enc-step-indicator');
-    if (!el) return;
-    el.innerHTML = STEP_ORDER.map((id, idx) => {
-        const active = id === state.step;
-        const done = STEP_ORDER.indexOf(state.step) > idx;
-        return `<span class="enc-step-dot ${active ? 'active' : ''} ${done ? 'done' : ''}">${idx + 1}. ${STEP_LABEL[id]}</span>`;
-    }).join('<span class="enc-step-sep">›</span>');
-}
-
-function renderNavButtons(): void {
-    const prevBtn = document.getElementById('enc-prev') as HTMLButtonElement;
-    const nextBtn = document.getElementById('enc-next') as HTMLButtonElement;
-    const idx = STEP_ORDER.indexOf(state.step);
-
-    prevBtn.style.visibility = idx === 0 ? 'hidden' : 'visible';
-    nextBtn.style.display = state.step === 'result' ? 'none' : '';
-    nextBtn.disabled = !canGoNext();
-
-    prevBtn.onclick = () => {
-        state.step = STEP_ORDER[Math.max(0, idx - 1)];
+    if (!catalog) return;
+    // 정옵션이 있으면 입력이 바뀔 때마다 결과를 다시 계산한다.
+    if (state.positiveStats.length === 0) {
         state.result = null;
-        rerender();
-    };
-    nextBtn.onclick = async () => {
-        if (!canGoNext()) return;
-        const nextIdx = idx + 1;
-        if (STEP_ORDER[nextIdx] === 'result') {
-            await runCalculation();
-        }
-        state.step = STEP_ORDER[Math.min(STEP_ORDER.length - 1, nextIdx)];
-        rerender();
-    };
-    document.getElementById('enc-reset')!.onclick = () => {
-        state = createInitialState();
-        rerender();
-    };
+        lastSignature = '';
+    } else if (inputSignature() !== lastSignature) {
+        runCalculation();
+        lastSignature = inputSignature();
+    }
+    renderSections();
 }
 
-async function runCalculation(): Promise<void> {
+function renderSections(): void {
+    const equip = document.getElementById('enc-sec-equip');
+    const positive = document.getElementById('enc-sec-positive');
+    const negative = document.getElementById('enc-sec-negative');
+    const result = document.getElementById('enc-sec-result');
+    if (!equip || !positive || !negative || !result) return;
+
+    // 다시 그려도 스크롤 위치가 맨 위로 튀지 않도록 기억해 두었다가 되돌린다.
+    const pageY = window.scrollY;
+    const inner = ['.pz-pick-scroll', '.pz-steps-scroll'].map(sel => document.querySelector<HTMLElement>(sel)?.scrollTop ?? 0);
+
+    const waiting = state.positiveStats.length === 0 || !state.result;
+    equip.innerHTML = renderEquipmentStepHtml();
+    positive.innerHTML = renderStatPickerHtml('positive');
+    negative.innerHTML = renderAutoBoxHtml();
+    result.innerHTML = renderResultStepHtml(waiting);
+
+    bindEquipmentStep();
+    bindStatPickerStep('positive');
+    document.getElementById('enc-auto-toggle')?.addEventListener('click', () => { autoOpen = !autoOpen; rerender(); });
+    if (autoOpen) bindNegativeStep();
+    if (!waiting) bindResultStep();
+
+    ['.pz-pick-scroll', '.pz-steps-scroll'].forEach((sel, i) => {
+        const el = document.querySelector<HTMLElement>(sel);
+        if (el) el.scrollTop = inner[i];
+    });
+    window.scrollTo(window.scrollX, pageY);
+}
+
+function runCalculation(): void {
     const negatives = negativeStats();
     let potential = state.originalPotential;
     if (state.autoFindPotential) {
@@ -227,10 +261,64 @@ function manualAllStats(): EnchantStat[] {
 
 /** 아직 배치되지 않고 남아있는 값 (부호 포함). 0이면 이 스탯은 전부 배치 완료. */
 function manualRemaining(stat: EnchantStat): number {
-    const placedSum = state.manualPlaced
-        .filter(p => p.stat.statKey === stat.statKey)
-        .reduce((sum, p) => sum + p.amount, 0);
+    const placedSum = state.manualPlaced.reduce((sum, p) => {
+        if (p.members) return sum + p.members.filter(m => m.stat.statKey === stat.statKey).reduce((a, m) => a + m.amount, 0);
+        return p.stat.statKey === stat.statKey ? sum + p.amount * (p.repeat ?? 1) : sum;
+    }, 0);
     return stat.value - placedSum;
+}
+
+/** "직접 순서 조정"을 누르면 자동으로 짠 부여 단계를 그대로 넘겨받아 거기서부터 순서를 고친다. */
+function seedManualFromAuto(): void {
+    state.manualPlaced = [];
+    state.manualCustomAmount = {};
+    const result = state.result;
+    if (!result) return;
+    const all = manualAllStats();
+    const cumulative = new Map<string, number>();
+    result.steps.forEach(step => {
+        const repeat = step.repeatCount ?? 1;
+        if (step.type === 'each' && step.stats.length === 1 && repeat > 1) {
+            const shown = step.stats[0];
+            const sign = shown.value > 0 ? 1 : -1;
+            state.manualPlaced.push({ stat: all.find(x => x.statKey === shown.statKey) ?? shown, amount: sign, repeat });
+            cumulative.set(shown.statKey, (cumulative.get(shown.statKey) ?? 0) + sign * repeat);
+            return;
+        }
+        const members = step.stats
+            .map(shown => {
+                const amount = shown.value - (cumulative.get(shown.statKey) ?? 0);
+                cumulative.set(shown.statKey, shown.value);
+                return { stat: all.find(x => x.statKey === shown.statKey) ?? shown, amount };
+            })
+            .filter(m => m.amount !== 0);
+        if (members.length === 0) return;
+        if (members.length === 1) {
+            state.manualPlaced.push({ stat: members[0].stat, amount: members[0].amount, repeat: 1 });
+        } else {
+            state.manualPlaced.push({ stat: members[0].stat, amount: members[0].amount, repeat: 1, members });
+        }
+    });
+}
+
+/** 한 번 배치한다. 직전 줄과 같은 스탯의 ±1이면 새 줄을 만들지 않고 반복 횟수만 올린다. */
+function placeManual(stat: EnchantStat, amount: number): void {
+    if (amount === 0) return;
+    const last = state.manualPlaced[state.manualPlaced.length - 1];
+    if (Math.abs(amount) === 1 && last && !last.members && last.stat.statKey === stat.statKey && last.amount === amount) {
+        last.repeat = (last.repeat ?? 1) + 1;
+    } else {
+        state.manualPlaced.push({ stat, amount, repeat: 1 });
+    }
+    recomputeResult();
+    rerender();
+}
+
+function manualAmountFor(stat: EnchantStat): number {
+    const remaining = manualRemaining(stat);
+    const limit = Math.abs(remaining);
+    const raw = Math.trunc(Number(state.manualCustomAmount[stat.statKey] ?? 1)) || 1;
+    return Math.max(1, Math.min(raw, limit));
 }
 
 function recomputeResult(): void {
@@ -256,95 +344,69 @@ function recomputeResult(): void {
     }
 }
 
-function renderBody(): void {
-    const body = document.getElementById('enc-body')!;
-    if (state.step === 'equipment') {
-        body.innerHTML = renderEquipmentStepHtml();
-        bindEquipmentStep();
-    } else if (state.step === 'positive') {
-        body.innerHTML = renderStatPickerHtml('positive');
-        bindStatPickerStep('positive');
-    } else if (state.step === 'negative') {
-        body.innerHTML = renderNegativeStepHtml();
-        bindNegativeStep();
-    } else {
-        body.innerHTML = renderResultStepHtml();
-        bindResultStep();
-    }
-}
-
-// ==================== 1. 장비 선택 ====================
-
 function renderEquipmentStepHtml(): string {
     const s = state.settings;
     const materialLabels = catalog!.materialTypes;
+    const typeBtn = (field: EquipmentFieldType, orig: boolean, label: string): string => {
+        const on = state.fieldType === field && state.isOriginalElement === orig;
+        return `<button type="button" class="pz-btn ${on ? 'pz-btn-primary' : ''}" data-field="${field}" data-orig="${orig ? 1 : 0}">${label}</button>`;
+    };
     return `
-    <div class="enc-card">
-      <div class="enc-card-title">⚔️ 장비 종류</div>
-      <div class="enc-choice-row">
-        <button class="enc-choice-btn ${state.fieldType === 'mainWeapon' && !state.isOriginalElement ? 'active' : ''}" data-field="mainWeapon" data-orig="0">무기</button>
-        <button class="enc-choice-btn ${state.fieldType === 'bodyArmor' ? 'active' : ''}" data-field="bodyArmor" data-orig="0">방어구</button>
-        <button class="enc-choice-btn ${state.fieldType === 'mainWeapon' && state.isOriginalElement ? 'active' : ''}" data-field="mainWeapon" data-orig="1">무기(속성 유지)</button>
+    <div class="pz-panel">
+      <div class="pz-label" style="margin-bottom:6px;">장비 종류</div>
+      <div class="pz-row pz-types-row">
+        ${typeBtn('mainWeapon', false, '무기')}
+        ${typeBtn('bodyArmor', false, '방어구')}
+        ${typeBtn('mainWeapon', true, '무기(속성 유지)')}
       </div>
-    </div>
-    <div class="enc-card">
-      <div class="enc-card-title">💎 장비 초기 잠재력</div>
-      <div class="enc-choice-row">
-        <button class="enc-choice-btn ${state.autoFindPotential ? 'active' : ''}" id="enc-auto-potential">자동으로 최소 잠재력 찾기</button>
+      <div class="pz-row" style="margin-top:10px;">
+        <button type="button" class="pz-btn pz-btn-primary pz-grow" id="enc-auto-potential">${state.autoFindPotential ? '✔ 최소 잠재력 자동 찾기 (켜짐)' : '최소 잠재력 자동 찾기'}</button>
       </div>
-      ${
-          state.autoFindPotential
-              ? '<div class="enc-hint">성공률 100%를 만족하는 최소 잠재력을 자동으로 계산합니다.</div>'
-              : `<div class="enc-inline-input">
-             <label>초기 잠재력</label>
-             <button class="enc-btn-mini" id="enc-potential-minus" aria-label="감소">−</button>
-             <input type="number" id="enc-potential-input" min="1" value="${state.originalPotential}">
-             <button class="enc-btn-mini" id="enc-potential-plus" aria-label="증가">+</button>
-           </div>`
-      }
-    </div>
-    <div class="enc-card">
-      <button class="enc-collapse-toggle" id="enc-advanced-toggle">${state.showAdvanced ? '▲' : '▼'} 고급 설정 (레벨 / 대장 Lv / 소재스킬)</button>
-      ${
-          state.showAdvanced
-              ? `
-        <div class="enc-advanced-grid">
-          <label>캐릭터 레벨<input type="number" id="enc-level" min="300" max="400" step="10" value="${s.level}"></label>
-          <label>대장 레벨<input type="number" id="enc-smith" min="0" max="300" step="10" value="${s.smithLevel}"></label>
-          <label>모루 스킬<input type="number" id="enc-anvil" min="20" max="50" step="5" value="${s.materialAnvilSkillLevelSum}"></label>
-          <label class="enc-check-inline">
-            <input type="checkbox" id="enc-experts2" ${s.hasExpertsCustomization2Skill ? 'checked' : ''}>
-            전문 커스터마이징2 보유 (예상 성공률 계산에만 반영)
-          </label>
-        </div>
-        <div class="enc-advanced-grid">
-          ${materialLabels
-              .map(
-                  (name, idx) =>
-                      `<label>${name} 소재스킬<input type="number" class="enc-material-skill" data-idx="${idx}" min="5" max="10" value="${s.materialSkillLevels[idx]}"></label>`
-              )
-              .join('')}
-        </div>`
-              : ''
-      }
+      <div class="pz-fields">
+        <label class="pz-field">레벨<input type="number" id="enc-level" min="300" max="400" step="10" value="${s.level}"></label>
+        <label class="pz-field">숙련도<input type="number" id="enc-smith" min="0" max="300" step="10" value="${s.smithLevel}"></label>
+        <label class="pz-field">모루 스킬<input type="number" id="enc-anvil" min="20" max="50" step="5" value="${s.materialAnvilSkillLevelSum}"></label>
+        <div class="pz-field">소재 스킬<button type="button" class="pz-btn ${skillsOpen ? 'on' : ''}" id="enc-skill-toggle">${skillsOpen ? '접기' : '설정'}</button></div>
+      </div>
+      <label class="pz-check"><input type="checkbox" id="enc-experts2" ${s.hasExpertsCustomization2Skill ? 'checked' : ''}> 전문 커스터마이징2 보유 <small>(예상 성공률에만 반영)</small></label>
+      ${skillsOpen ? `<div class="pz-skills">${materialLabels.map((name, idx) => `<label class="pz-field">${name}<input type="number" class="enc-material-skill" data-idx="${idx}" min="5" max="10" value="${s.materialSkillLevels[idx]}"></label>`).join('')}</div>` : ''}
+      ${state.autoFindPotential
+          ? `<div class="pz-hint">성공률 100%를 만족하는 최소 잠재력을 자동으로 계산합니다.${state.resolvedPotential != null && state.positiveStats.length ? ` (현재 <b>${state.resolvedPotential}</b>)` : ''}</div>`
+          : `<div class="pz-potential">
+               <span class="pz-label">잠재력</span>
+               <button type="button" class="pz-mini" id="enc-potential-minus" aria-label="감소">−</button>
+               <input type="range" id="enc-potential-range" min="1" max="200" value="${Math.min(200, state.originalPotential)}">
+               <button type="button" class="pz-mini" id="enc-potential-plus" aria-label="증가">+</button>
+               <input type="number" id="enc-potential-input" min="1" value="${state.originalPotential}">
+             </div>`}
     </div>
   `;
 }
 
 function bindEquipmentStep(): void {
-    document.querySelectorAll<HTMLButtonElement>('.enc-choice-btn[data-field]').forEach(btn => {
+    document.getElementById('enc-auto-potential')?.addEventListener('click', () => {
+        state.autoFindPotential = !state.autoFindPotential;
+        rerender();
+    });
+    document.querySelectorAll<HTMLButtonElement>('.pz-btn[data-field]').forEach(btn => {
         btn.addEventListener('click', () => {
             state.fieldType = btn.dataset.field as EquipmentFieldType;
             state.isOriginalElement = btn.dataset.orig === '1';
             rerender();
         });
     });
-    document.getElementById('enc-auto-potential')?.addEventListener('click', () => {
-        state.autoFindPotential = !state.autoFindPotential;
+    document.getElementById('enc-skill-toggle')?.addEventListener('click', () => {
+        skillsOpen = !skillsOpen;
         rerender();
     });
-    document.getElementById('enc-potential-input')?.addEventListener('input', e => {
-        state.originalPotential = Number((e.target as HTMLInputElement).value) || 1;
+    const potentialInput = document.getElementById('enc-potential-input') as HTMLInputElement | null;
+    potentialInput?.addEventListener('change', () => {
+        state.originalPotential = Math.max(1, Number(potentialInput.value) || 1);
+        rerender();
+    });
+    document.getElementById('enc-potential-range')?.addEventListener('change', e => {
+        state.originalPotential = Math.max(1, Number((e.target as HTMLInputElement).value) || 1);
+        rerender();
     });
     document.getElementById('enc-potential-minus')?.addEventListener('click', () => {
         state.originalPotential = Math.max(1, state.originalPotential - 1);
@@ -354,31 +416,29 @@ function bindEquipmentStep(): void {
         state.originalPotential += 1;
         rerender();
     });
-    document.getElementById('enc-advanced-toggle')?.addEventListener('click', () => {
-        state.showAdvanced = !state.showAdvanced;
-        rerender();
-    });
-    document.getElementById('enc-level')?.addEventListener('input', e => {
-        state.settings.level = Number((e.target as HTMLInputElement).value) || 1;
-    });
-    document.getElementById('enc-smith')?.addEventListener('input', e => {
-        state.settings.smithLevel = Number((e.target as HTMLInputElement).value) || 0;
-    });
-    document.getElementById('enc-anvil')?.addEventListener('input', e => {
-        state.settings.materialAnvilSkillLevelSum = Number((e.target as HTMLInputElement).value) || 0;
-    });
+    const numberSetting = (id: string, apply: (v: number) => void): void => {
+        const el = document.getElementById(id) as HTMLInputElement | null;
+        el?.addEventListener('change', () => { apply(Number(el.value) || 0); rerender(); });
+    };
+    numberSetting('enc-level', v => { state.settings.level = v || 1; });
+    numberSetting('enc-smith', v => { state.settings.smithLevel = v; });
+    numberSetting('enc-anvil', v => { state.settings.materialAnvilSkillLevelSum = v; });
     document.getElementById('enc-experts2')?.addEventListener('change', e => {
         state.settings.hasExpertsCustomization2Skill = (e.target as HTMLInputElement).checked;
+        rerender();
     });
     document.querySelectorAll<HTMLInputElement>('.enc-material-skill').forEach(input => {
-        input.addEventListener('input', () => {
-            const idx = Number(input.dataset.idx);
-            state.settings.materialSkillLevels[idx] = Number(input.value) || 0;
+        input.addEventListener('change', () => {
+            state.settings.materialSkillLevels[Number(input.dataset.idx)] = Number(input.value) || 0;
+            rerender();
         });
     });
 }
 
 // ==================== 2. 정옵션 선택 (버튼형, 팝업 없음) ====================
+
+// 옵션 선택 목록을 펼쳐 둘지 (다시 그려도 유지)
+let pickerOpen = true;
 
 function renderStatPickerHtml(kind: 'positive'): string {
     const selected = state.positiveStats;
@@ -405,9 +465,17 @@ function renderStatPickerHtml(kind: 'positive'): string {
 
     const selectedHtml =
         selected.length === 0
-            ? '<div class="enc-empty-hint">선택된 정옵션이 없습니다. 아래에서 능력을 선택해주세요.</div>'
+            ? '<div class="pz-empty">선택된 옵션이 없습니다. "옵션 선택"에서 고르세요.</div>'
             : selected
                   .map(stat => {
+                      if (stat.item.isToggle(stat.type)) {
+                          // 최대 1인 옵션(속성 부여): 숫자와 +/- 없이 이름과 삭제 버튼만
+                          return `
+              <div class="enc-selected-row" data-key="${stat.statKey}">
+                <span class="enc-selected-label">${stat.showLabel()}</span>
+                <button class="enc-remove-btn" data-key="${stat.statKey}">✕</button>
+              </div>`;
+                      }
                       return `
               <div class="enc-selected-row" data-key="${stat.statKey}">
                 <span class="enc-selected-label">${stat.showLabel()}</span>
@@ -420,23 +488,24 @@ function renderStatPickerHtml(kind: 'positive'): string {
                   .join('');
 
     return `
-    <div class="enc-card">
-      <div class="enc-card-title">➕ 정옵션(플러스) 선택 <span class="enc-count-badge">${selected.length} / ${MAX_ABILITY_LINES}</span></div>
-      <div class="enc-hint">최소 1개, 최대 ${MAX_ABILITY_LINES}개까지 선택할 수 있습니다. (남은 슬롯 ${remaining}개)</div>
-      <div class="enc-choice-row">
-        <button class="enc-choice-btn ${state.positiveAutoFill ? 'active' : ''}" id="enc-autofill-toggle">선택 시 자동으로 상한값 채우기</button>
+    <div class="pz-panel pz-options">
+      <div class="pz-options-head">
+        <b>옵션 <span class="pz-count">${selected.length} / ${MAX_ABILITY_LINES}</span></b>
+        <button type="button" class="pz-btn pz-btn-primary" id="enc-pick-toggle">${pickerOpen ? '옵션 선택 닫기' : '옵션 선택'}</button>
       </div>
-      <div class="enc-selected-list">${selectedHtml}</div>
+      ${pickerOpen
+          ? `<div class="pz-pick-scroll">
+               ${categoriesHtml}
+             </div>`
+          : ''}
+      <div class="pz-selected">${selectedHtml}</div>
+      <div class="pz-hint">최소 1개, 최대 ${MAX_ABILITY_LINES}개 (남은 슬롯 ${remaining}개)</div>
     </div>
-    <div class="enc-card">${categoriesHtml}</div>
   `;
 }
 
 function bindStatPickerStep(_kind: 'positive'): void {
-    document.getElementById('enc-autofill-toggle')?.addEventListener('click', () => {
-        state.positiveAutoFill = !state.positiveAutoFill;
-        rerender();
-    });
+    document.getElementById('enc-pick-toggle')?.addEventListener('click', () => { pickerOpen = !pickerOpen; rerender(); });
     document.querySelectorAll<HTMLButtonElement>('.enc-stat-chip').forEach(btn => {
         btn.addEventListener('click', () => {
             const itemId = btn.dataset.item!;
@@ -498,22 +567,47 @@ function togglePositiveStat(itemId: string, type: StatValueType): void {
 
 // ==================== 3. 마이너스옵션 선택 ====================
 
+function renderAutoBoxHtml(): string {
+    const negatives = negativeStats();
+    const slots = MAX_ABILITY_LINES - state.positiveStats.length;
+    const summary = state.negativeMode === 'auto'
+        ? `마이너스 옵션 자동 선택 · ${state.negativeAutoGoal === 'successRate' ? '성공률 우선' : '재료 절약'} (${negatives.length}/${slots})`
+        : `마이너스 옵션 직접 선택 (${state.negativeStatsManual.length}/${slots})`;
+    return `
+    <button type="button" class="pz-auto-head" id="enc-auto-toggle" aria-expanded="${autoOpen}">
+      <span>${summary}</span><span>${autoOpen ? '접기 ▴' : '설정 ▾'}</span>
+    </button>
+    ${autoOpen ? renderNegativeStepHtml() : ''}`;
+}
+
 function renderNegativeStepHtml(): string {
     const remainingSlots = MAX_ABILITY_LINES - state.positiveStats.length;
     const negatives = negativeStats();
 
+    // 자동 선택일 때만 "-개수" 버튼을 같은 줄에 둔다. 켜진 버튼을 다시 누르면 꺼지고(최대), 아무것도 안 켜져 있으면 남은 슬롯을 모두 채운다.
+    const maxCount = Math.max(0, remainingSlots);
+    const currentCount = state.negativeAutoCountOn ? Math.min(state.negativeAutoCount ?? maxCount, maxCount) : maxCount;
+    const countOn = state.negativeAutoCountOn;
+    // "옵션 개수" 텍스트 버튼은 자동/직접 선택 줄에, 켰을 때의 − 숫자 + 는 그 아랫줄에 둔다.
+    const showCount = state.negativeMode === 'auto' && maxCount > 0;
+    const countButtons = showCount
+        ? `<button class="enc-choice-btn ${countOn ? 'active' : ''}" id="enc-auto-count-toggle" aria-pressed="${countOn}" title="마이너스 옵션 개수를 직접 정합니다 (끄면 남은 슬롯을 모두 채움)">옵션 개수</button>`
+        : '';
+    const countRow = showCount && countOn
+        ? `<div class="enc-choice-row enc-count-row">
+             <button class="enc-btn-mini" id="enc-auto-count-minus" aria-label="개수 줄이기" ${currentCount <= 1 ? 'disabled' : ''}>−</button>
+             <span class="enc-count-value">${currentCount}</span>
+             <button class="enc-btn-mini" id="enc-auto-count-plus" aria-label="개수 늘리기" ${currentCount >= maxCount ? 'disabled' : ''}>+</button>
+           </div>`
+        : '';
     const modeButtons = `
     <div class="enc-choice-row">
       <button class="enc-choice-btn ${state.negativeMode === 'auto' ? 'active' : ''}" data-mode="auto">자동 선택</button>
       <button class="enc-choice-btn ${state.negativeMode === 'manual' ? 'active' : ''}" data-mode="manual">직접 선택</button>
+      ${countButtons}
     </div>`;
 
     if (state.negativeMode === 'auto') {
-        const goalButtons = `
-      <div class="enc-choice-row">
-        <button class="enc-choice-btn ${state.negativeAutoGoal === 'successRate' ? 'active' : ''}" data-goal="successRate">🎯 성공률 우선</button>
-        <button class="enc-choice-btn ${state.negativeAutoGoal === 'material' ? 'active' : ''}" data-goal="material">💰 재료 절약</button>
-      </div>`;
         const listHtml =
             negatives.length === 0
                 ? '<div class="enc-empty-hint">제거할 수 있는 능력이 없습니다 (정옵션 슬롯이 가득 찼을 수 있습니다).</div>'
@@ -521,12 +615,12 @@ function renderNegativeStepHtml(): string {
         return `
       <div class="enc-card">
         <div class="enc-card-title">➖ 마이너스옵션(자동) <span class="enc-count-badge">${negatives.length} / ${remainingSlots}</span></div>
-        <div class="enc-hint">남은 ${remainingSlots}개의 슬롯을 자동으로 채웁니다. 목표를 선택하세요.</div>
+        <div class="enc-hint">남은 ${remainingSlots}개의 슬롯을 모두 채웁니다. 개수를 직접 정하려면 '옵션 개수'를 켜세요.</div>
         ${modeButtons}
-        ${goalButtons}
-        <div class="enc-inline-input">
-          <label>자동 선택 개수 (비우면 최대)</label>
-          <input type="number" id="enc-auto-count" min="0" max="${remainingSlots}" value="${state.negativeAutoCount ?? ''}" placeholder="${remainingSlots}">
+        ${countRow}
+        <div class="enc-choice-row">
+          <button class="enc-choice-btn ${state.negativeAutoGoal === 'successRate' ? 'active' : ''}" data-goal="successRate">🎯 성공률 우선</button>
+          <button class="enc-choice-btn ${state.negativeAutoGoal === 'material' ? 'active' : ''}" data-goal="material">💰 재료 절약</button>
         </div>
         <div class="enc-selected-list">${listHtml}</div>
       </div>
@@ -558,6 +652,7 @@ function renderNegativeStepHtml(): string {
                     const types: StatValueType[] = item.hasMultiplier ? ['constant', 'multiplier'] : ['constant'];
                     return types
                         .filter(type => {
+                            if (item.isToggle(type)) return false;
                             const { min } = item.getLimit(type, state.fieldType, state.isOriginalElement, state.settings.level);
                             return min < 0;
                         })
@@ -597,9 +692,19 @@ function bindNegativeStep(): void {
             rerender();
         });
     });
-    document.getElementById('enc-auto-count')?.addEventListener('input', e => {
-        const v = (e.target as HTMLInputElement).value;
-        state.negativeAutoCount = v === '' ? null : Math.max(0, Number(v));
+    const countMax = (): number => MAX_ABILITY_LINES - state.positiveStats.length;
+    const countNow = (): number => Math.min(state.negativeAutoCount ?? countMax(), countMax());
+    document.getElementById('enc-auto-count-toggle')?.addEventListener('click', () => {
+        state.negativeAutoCountOn = !state.negativeAutoCountOn;
+        state.negativeAutoCount = state.negativeAutoCountOn ? countMax() : null; // 끄면 최대
+        rerender();
+    });
+    document.getElementById('enc-auto-count-minus')?.addEventListener('click', () => {
+        state.negativeAutoCount = Math.max(1, countNow() - 1);
+        rerender();
+    });
+    document.getElementById('enc-auto-count-plus')?.addEventListener('click', () => {
+        state.negativeAutoCount = Math.min(countMax(), countNow() + 1);
         rerender();
     });
     document.querySelectorAll<HTMLButtonElement>('[data-neg-item]').forEach(btn => {
@@ -676,15 +781,19 @@ function renderManualBuilderHtml(): string {
             const remaining = manualRemaining(stat);
             if (remaining === 0) return '';
             const sign = remaining > 0 ? 1 : -1;
-            const customValue = state.manualCustomAmount[stat.statKey] ?? '';
+            const toggle = stat.item.isToggle(stat.type);
+            const amount = manualAmountFor(stat);
+            const unit = stat.type === 'multiplier' ? '%' : '';
             return `
         <div class="enc-palette-row">
-          <span class="enc-selected-label ${remaining < 0 ? 'negative' : ''}">${stat.showValueLabel(remaining)} 남음</span>
+          <span class="enc-selected-label ${remaining < 0 ? 'negative' : ''}">${stat.showValueLabel(remaining)} <small>남음</small></span>
           <div class="enc-palette-actions">
-            <button class="enc-btn-mini enc-place-btn" data-key="${stat.statKey}" data-amount="${sign}">+1</button>
-            <button class="enc-btn-mini enc-place-btn" data-key="${stat.statKey}" data-amount="${remaining}">전부</button>
-            <input type="number" class="enc-palette-custom" data-key="${stat.statKey}" placeholder="수치" value="${customValue}">
-            <button class="enc-btn-mini enc-place-custom-btn" data-key="${stat.statKey}" aria-label="입력한 만큼 추가">+</button>
+            ${toggle ? '' : `
+            <button class="enc-btn-mini enc-amt-btn" data-key="${stat.statKey}" data-delta="-1" aria-label="수치 감소">−</button>
+            <input type="number" class="enc-palette-custom" data-key="${stat.statKey}" min="1" max="${Math.abs(remaining)}" value="${amount}" aria-label="한 번에 배치할 수치">
+            <button class="enc-btn-mini enc-amt-btn" data-key="${stat.statKey}" data-delta="1" aria-label="수치 증가">+</button>`}
+            <button class="pz-btn enc-add-btn" data-key="${stat.statKey}" data-amount="${sign * (toggle ? 1 : amount)}">추가${toggle ? '' : ` ${sign < 0 ? '-' : '+'}${amount}${unit}`}</button>
+            ${toggle || Math.abs(remaining) === 1 ? '' : `<button class="pz-btn enc-all-btn" data-key="${stat.statKey}" data-amount="${remaining}">전부</button>`}
           </div>
         </div>`;
         })
@@ -692,15 +801,21 @@ function renderManualBuilderHtml(): string {
 
     const orderListHtml =
         state.manualPlaced.length === 0
-            ? '<div class="enc-empty-hint">아직 배치된 옵션이 없습니다. 위에서 버튼을 눌러 순서를 만들어보세요.</div>'
+            ? '<div class="enc-empty-hint">배치된 단계가 없습니다. 위에서 수치를 정하고 "추가"를 눌러 만들어보세요.</div>'
             : state.manualPlaced
                   .map((placed, idx) => {
                       const negative = placed.amount < 0;
+                      const repeat = placed.repeat ?? 1;
                       return `
           <div class="enc-order-row" data-idx="${idx}">
             <span class="enc-order-drag-handle" data-idx="${idx}" aria-label="드래그해서 순서 변경">⠿</span>
             <span class="enc-order-num">${idx + 1}</span>
-            <span class="enc-selected-label ${negative ? 'negative' : ''}">${placed.stat.showValueLabel(placed.amount)}</span>
+            <span class="enc-selected-label ${negative && !placed.members ? 'negative' : ''}">${placed.members
+                ? placed.members.map(m => `<span class="${m.amount < 0 ? 'enc-neg-part' : ''}">${m.stat.showValueLabel(m.amount)}</span>`).join(' ')
+                : placed.stat.showValueLabel(placed.amount)}${repeat > 1 ? ` <b class="enc-repeat">× ${repeat}회</b>` : ''}</span>
+            ${!placed.members && Math.abs(placed.amount) === 1 ? `
+            <button class="enc-btn-mini" data-rep="down" data-idx="${idx}" ${repeat <= 1 ? 'disabled' : ''} aria-label="반복 줄이기">−</button>
+            <button class="enc-btn-mini" data-rep="up" data-idx="${idx}" ${Math.abs(manualRemaining(placed.stat)) < 1 ? 'disabled' : ''} aria-label="반복 늘리기">+</button>` : ''}
             <button class="enc-btn-mini" data-move="up" data-idx="${idx}" ${idx === 0 ? 'disabled' : ''} aria-label="위로">▲</button>
             <button class="enc-btn-mini" data-move="down" data-idx="${idx}" ${idx === state.manualPlaced.length - 1 ? 'disabled' : ''} aria-label="아래로">▼</button>
             <button class="enc-remove-btn" data-remove-idx="${idx}" aria-label="제거">✕</button>
@@ -712,76 +827,85 @@ function renderManualBuilderHtml(): string {
 
     return `
     <div class="enc-card">
-      <div class="enc-card-title">🧩 배치 가능한 옵션</div>
-      <div class="enc-hint">버튼을 눌러 원하는 만큼 순서 목록 맨 뒤에 배치하세요.</div>
-      <div class="enc-selected-list">${paletteHtml || '<div class="enc-empty-hint">모든 옵션을 배치했습니다.</div>'}</div>
+      <div class="enc-card-title">📐 부여 순서 조정 ${allPlaced ? '' : '<span class="enc-count-badge">배치 중</span>'}</div>
+      <div class="enc-hint">자동으로 짠 부여 단계를 가져왔습니다. ⠿를 드래그하거나 ▲▼로 순서를 바꾸세요. +1을 반복한 단계는 한 줄에 × 횟수로 묶이고, − + 로 횟수를 조절합니다.</div>
+      <div class="enc-order-list">${orderListHtml}</div>
     </div>
     <div class="enc-card">
-      <div class="enc-card-title">📐 만든 순서 ${allPlaced ? '' : '<span class="enc-count-badge">배치 중</span>'}</div>
-      <div class="enc-hint">⠿를 드래그하거나 ▲▼로 순서를 바꿀 수 있습니다.</div>
-      <div class="enc-order-list">${orderListHtml}</div>
+      <div class="enc-card-title">🧩 단계 추가</div>
+      <div class="enc-hint">− + 로 수치를 정하고 "추가"를 누르면 순서 맨 뒤에 배치됩니다.</div>
+      <div class="enc-selected-list">${paletteHtml || '<div class="enc-empty-hint">모든 옵션을 배치했습니다.</div>'}</div>
     </div>
   `;
 }
 
-function renderResultStepHtml(): string {
+function renderResultStepHtml(waiting = false): string {
     const result = state.result;
-    if (!result) return '<div class="enc-card">계산 중 오류가 발생했습니다.</div>';
+    const materialNames = catalog!.materialTypes;
 
-    const successLabel = result.successRate === -1 ? '무제한(항상 성공)' : `${result.successRate.toFixed(1)}%`;
-    const expectedLabel = `${result.expectedSuccessRate.toFixed(1)}%`;
+    const successLabel = !result || waiting ? '—' : result.successRate === -1 ? '무제한' : `${result.successRate.toFixed(1)}%`;
+    const expectedLabel = !result || waiting ? '—' : `${result.expectedSuccessRate.toFixed(1)}%`;
+    const initial = result && !waiting ? result.originalPotential : state.autoFindPotential ? '—' : state.originalPotential;
+    const last = result && !waiting ? result.steps[result.steps.length - 1] : null;
+    const remain = last ? last.remainingPotential : result && !waiting ? result.originalPotential : '—';
+    const used = result && !waiting && last ? result.originalPotential - last.remainingPotential : '—';
 
-    const stepsHtml = result.steps
-        .map((step, idx) => {
-            return `
-        <div class="enc-result-step">
-          <span class="enc-result-step-num">${idx + 1}.</span>
-          ${stepLabelHtml(step)}
-          <span class="enc-result-step-cost">잠재력 ${step.potentialCost >= 0 ? '-' : '+'}${Math.abs(step.potentialCost)}</span>
-          <span class="enc-result-step-remain">잔여 ${step.remainingPotential}</span>
-        </div>`;
-        })
+    const rowsHtml = result && !waiting
+        ? result.steps
+              .map((step, idx) => `
+        <tr class="${step.potentialCost < 0 ? 'pz-gain' : ''}">
+          <td class="pz-td-num">${idx + 1}</td>
+          <td class="pz-td-opt">${stepLabelHtml(step)}</td>
+          <td class="pz-td-cost">${step.potentialCost >= 0 ? '-' : '+'}${Math.abs(step.potentialCost)}</td>
+          <td class="pz-td-remain ${step.remainingPotential < 0 ? 'bad' : ''}">${step.remainingPotential}</td>
+        </tr>`)
+              .join('')
+        : '<tr><td colspan="4" class="pz-empty">확정된 작업이 없습니다.</td></tr>';
+
+    const materialsHtml = materialNames
+        .map((name, idx) => `<div class="pz-mat"><span>${name}</span><b>${result && !waiting ? result.materialCostByType[idx].toLocaleString() : '—'}</b></div>`)
         .join('');
 
-    const materialsHtml = catalog!.materialTypes
-        .map((name, idx) => `<span class="enc-material-pill">${name} <b>${result.materialCostByType[idx].toLocaleString()}</b></span>`)
-        .join('');
-
-    const manualBuilderHtml = state.orderMode === 'manual' ? renderManualBuilderHtml() : '';
+    const manualBuilderHtml = !waiting && state.orderMode === 'manual' ? renderManualBuilderHtml() : '';
 
     return `
-    <div class="enc-card">
-      <div class="enc-card-title">🔀 부여 순서 방식</div>
-      <div class="enc-choice-row">
-        <button class="enc-choice-btn ${state.orderMode === 'auto' ? 'active' : ''}" data-order="auto">자동 순서(추천)</button>
-        <button class="enc-choice-btn ${state.orderMode === 'manual' ? 'active' : ''}" data-order="manual">직접 순서 조정</button>
+    <div class="pz-panel" ${waiting ? '' : 'id="enc-result-capture"'}>
+      <div class="pz-tiles">
+        <div class="pz-tile"><span>잠재력</span><b>${initial}</b></div>
+        <div class="pz-tile ${typeof remain === 'number' && remain < 0 ? 'bad' : ''}"><span>남은 잠재력</span><b>${remain}</b></div>
+        <div class="pz-tile"><span>소모 잠재력</span><b>${used}</b></div>
+        <div class="pz-tile"><span>표기 성공률</span><b>${successLabel}</b></div>
+        <div class="pz-tile"><span>성공 기대</span><b>${expectedLabel}</b></div>
+      </div>
+      ${result && !waiting && result.insufficientPotential ? '<div class="pz-warning">⚠️ 잠재력이 부족한 순서가 포함되어 있습니다. 잠재력을 늘리거나 옵션 수를 줄여보세요.</div>' : ''}
+      <div class="pz-split">
+        <div class="pz-mats"><h4>소모 소재</h4>${materialsHtml}</div>
+        <div class="pz-steps">
+          <h4>부여 단계</h4>
+          <div class="pz-steps-scroll">
+            <table class="pz-table">
+              <thead><tr><th>단계</th><th>옵션</th><th>잠재력</th><th>잔여</th></tr></thead>
+              <tbody>${rowsHtml}</tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+    ${waiting ? '' : `
+    <div class="pz-panel pz-order">
+      <div class="pz-row">
+        <b>부여 순서</b>
+        <div class="pz-seg">
+          <button type="button" class="enc-choice-btn ${state.orderMode === 'auto' ? 'on' : ''}" data-order="auto">자동 순서(추천)</button>
+          <button type="button" class="enc-choice-btn ${state.orderMode === 'manual' ? 'on' : ''}" data-order="manual">직접 순서 조정</button>
+        </div>
+        <div class="pz-grow"></div>
+        <button type="button" class="pz-btn" id="enc-save-image">이미지</button>
+        <button type="button" class="pz-btn" id="enc-save-text">텍스트</button>
       </div>
     </div>
     ${manualBuilderHtml}
-    <div id="enc-result-capture">
-      <div class="enc-card">
-        <div class="enc-card-title">📋 부여 순서</div>
-        ${state.autoFindPotential ? `<div class="enc-hint">자동으로 찾은 최소 잠재력: <b>${state.resolvedPotential}</b></div>` : ''}
-        <div class="enc-result-steps">${stepsHtml}</div>
-      </div>
-      <div class="enc-card">
-        <div class="enc-card-title">🧪 재료비 (소재타입별 합계)</div>
-        <div class="enc-material-row">${materialsHtml}</div>
-      </div>
-      <div class="enc-card">
-        <div class="enc-card-title">⭐ 성공률</div>
-        <div class="enc-success-row">
-          <div class="enc-success-box"><div class="enc-success-label">성공률</div><div class="enc-success-value">${successLabel}</div></div>
-          <div class="enc-success-box"><div class="enc-success-label">예상 성공률</div><div class="enc-success-value">${expectedLabel}</div></div>
-        </div>
-        ${result.insufficientPotential ? '<div class="enc-warning">⚠️ 잠재력이 부족한 순서가 포함되어 있습니다. 잠재력을 늘리거나 옵션 수를 줄여보세요.</div>' : ''}
-      </div>
-    </div>
-    <div class="enc-export-row">
-      <button class="enc-choice-btn" id="enc-save-image">📸 이미지로 저장</button>
-      <button class="enc-choice-btn" id="enc-save-text">📋 텍스트로 복사</button>
-    </div>
-    <textarea class="enc-text-export" id="enc-text-export" readonly style="display:none;"></textarea>
+    <textarea class="enc-text-export" id="enc-text-export" readonly style="display:none;"></textarea>`}
   `;
 }
 
@@ -823,7 +947,21 @@ function buildResultText(): string {
 function bindResultStep(): void {
     document.querySelectorAll<HTMLButtonElement>('.enc-choice-btn[data-order]').forEach(btn => {
         btn.addEventListener('click', () => {
-            state.orderMode = btn.dataset.order as OrderMode;
+            const next = btn.dataset.order as OrderMode;
+            if (next === state.orderMode) return;
+            // 직접 순서 조정으로 넘어갈 때는 자동 부여 단계를 그대로 가져온다
+            if (next === 'manual') seedManualFromAuto();
+            state.orderMode = next;
+            recomputeResult();
+            rerender();
+        });
+    });
+    document.querySelectorAll<HTMLButtonElement>('.enc-btn-mini[data-rep]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const placed = state.manualPlaced[Number(btn.dataset.idx)];
+            if (!placed) return;
+            const delta = btn.dataset.rep === 'up' ? 1 : -1;
+            placed.repeat = Math.max(1, (placed.repeat ?? 1) + delta);
             recomputeResult();
             rerender();
         });
@@ -848,37 +986,28 @@ function bindResultStep(): void {
             rerender();
         });
     });
-    document.querySelectorAll<HTMLButtonElement>('.enc-place-btn').forEach(btn => {
+    document.querySelectorAll<HTMLButtonElement>('.enc-amt-btn').forEach(btn => {
         btn.addEventListener('click', () => {
-            const key = btn.dataset.key!;
-            const amount = Number(btn.dataset.amount);
-            const stat = manualAllStats().find(s => s.statKey === key);
-            if (!stat || amount === 0) return;
-            state.manualPlaced.push({ stat, amount });
-            recomputeResult();
+            const stat = manualAllStats().find(x => x.statKey === btn.dataset.key);
+            if (!stat) return;
+            const next = manualAmountFor(stat) + Number(btn.dataset.delta);
+            state.manualCustomAmount[stat.statKey] = String(Math.max(1, Math.min(next, Math.abs(manualRemaining(stat)))));
             rerender();
         });
     });
     document.querySelectorAll<HTMLInputElement>('.enc-palette-custom').forEach(input => {
-        input.addEventListener('input', () => {
-            state.manualCustomAmount[input.dataset.key!] = input.value;
+        input.addEventListener('change', () => {
+            const stat = manualAllStats().find(x => x.statKey === input.dataset.key);
+            if (!stat) return;
+            state.manualCustomAmount[stat.statKey] = input.value;
+            state.manualCustomAmount[stat.statKey] = String(manualAmountFor(stat));
+            rerender();
         });
     });
-    document.querySelectorAll<HTMLButtonElement>('.enc-place-custom-btn').forEach(btn => {
+    document.querySelectorAll<HTMLButtonElement>('.enc-add-btn, .enc-all-btn').forEach(btn => {
         btn.addEventListener('click', () => {
-            const key = btn.dataset.key!;
-            const stat = manualAllStats().find(s => s.statKey === key);
-            if (!stat) return;
-            const remaining = manualRemaining(stat);
-            const raw = Number(state.manualCustomAmount[key]);
-            if (!raw) return;
-            const sign = remaining > 0 ? 1 : -1;
-            const amount = sign * Math.min(Math.abs(raw), Math.abs(remaining));
-            if (amount === 0) return;
-            state.manualPlaced.push({ stat, amount });
-            delete state.manualCustomAmount[key];
-            recomputeResult();
-            rerender();
+            const stat = manualAllStats().find(x => x.statKey === btn.dataset.key);
+            if (stat) placeManual(stat, Number(btn.dataset.amount));
         });
     });
     document.getElementById('enc-save-image')?.addEventListener('click', () => {

@@ -262,6 +262,9 @@ export function computeEnchantResult(params: {
 export interface ManualPlacedStep {
     stat: EnchantStat;
     amount: number; // 이 스텝에서 실제로 부여할 값 (부호 포함, 목표값을 넘지 않는 한 임의의 크기)
+    repeat?: number; // 같은 amount 를 연속으로 몇 번 부여하는지 (기본 1). +1 반복을 한 줄로 묶어 보여 준다.
+    // 여러 능력을 한 번에 부여하는 묶음 단계 (자동 단계의 마이너스 일괄 부여 등). stat/amount 는 첫 항목과 같다.
+    members?: { stat: EnchantStat; amount: number }[];
 }
 
 /**
@@ -291,18 +294,43 @@ export function computeManualOrderResult(params: {
     const remainders: number[] = [];
 
     orderedSteps.forEach(placed => {
-        const before = cumulative.get(placed.stat.statKey) ?? 0;
-        const cost = placed.stat.item.calcPotentialCost(placed.stat.type, placed.amount, before, fieldType, isOriginalElement);
-        cumulative.set(placed.stat.statKey, before + placed.amount);
-        remaining -= cost;
-        remainders.push(remaining);
+        if (placed.members && placed.members.length > 1) {
+            // 묶음 단계: 자동 계산과 같은 식(같은 분류가 몰리면 소모가 늘어남)으로 한 번에 계산한다.
+            const extraRate = calcExtraRateForStats(placed.members.map(m => m.stat));
+            let raw = 0;
+            const displays: EnchantStat[] = [];
+            placed.members.forEach(m => {
+                const before = cumulative.get(m.stat.statKey) ?? 0;
+                raw += m.stat.item.calcPotentialCost(m.stat.type, m.amount, before, fieldType, isOriginalElement);
+                cumulative.set(m.stat.statKey, before + m.amount);
+                const shown = m.stat.clone();
+                shown.value = before + m.amount;
+                displays.push(shown);
+            });
+            const cost = realPotentialCost((raw * extraRate) / 100);
+            remaining -= cost;
+            remainders.push(remaining);
+            steps.push({ stats: displays, type: 'bulk', potentialCost: cost, remainingPotential: remaining });
+            return;
+        }
+        const repeat = Math.max(1, placed.repeat ?? 1);
+        let totalCost = 0;
+        for (let r = 0; r < repeat; r++) {
+            const before = cumulative.get(placed.stat.statKey) ?? 0;
+            const cost = placed.stat.item.calcPotentialCost(placed.stat.type, placed.amount, before, fieldType, isOriginalElement);
+            cumulative.set(placed.stat.statKey, before + placed.amount);
+            remaining -= cost;
+            totalCost += cost;
+            remainders.push(remaining);
+        }
 
         const displayStat = placed.stat.clone();
         displayStat.value = cumulative.get(placed.stat.statKey)!;
         steps.push({
             stats: [displayStat],
-            type: 'bulk',
-            potentialCost: cost,
+            type: repeat > 1 ? 'each' : 'bulk',
+            repeatCount: repeat > 1 ? repeat : undefined,
+            potentialCost: totalCost,
             remainingPotential: remaining,
         });
     });
@@ -333,8 +361,11 @@ export interface NegativeCandidate {
 
 /**
  * 마이너스옵션 자동 선택.
- * - successRate 모드: 제거 시 회수되는 잠재력이 큰 능력 위주로 선택 (성공률 우선)
- * - material 모드: 제거 재료비가 적은 능력 위주로 선택 (재료 절약)
+ * - material 모드(재료 절약): 제거 재료비가 적은 능력 위주로 고른다.
+ * - successRate 모드(성공률 우선):
+ * 1) 실제 잠재력 공식(변환 임계값, TEC 할인 포함)으로 "제거 시 돌려받는 잠재력"이 큰 능력부터 고른다.
+ * 2) 잠재력이 정해져 있고 정옵션이 있으면, 고른 조합과 나머지 후보를 하나씩 바꿔 가며
+ *    실제 성공률을 계산해 더 높아지는 교체를 반복한다. (성공률이 같으면 예상 성공률, 회수 잠재력 순)
  */
 export function autoSelectNegativeStats(params: {
     candidates: NegativeCandidate[];
@@ -344,21 +375,62 @@ export function autoSelectNegativeStats(params: {
     isOriginalElement: boolean;
     level: number;
     settings: CharacterSettings;
+    positiveStats: EnchantStat[];
+    // null 이면 잠재력을 자동으로 찾는 중이라 성공률을 비교할 수 없으므로 회수 잠재력만 본다.
+    originalPotential: number | null;
 }): EnchantStat[] {
-    const { candidates, count, mode, fieldType, isOriginalElement, level, settings } = params;
+    const { candidates, count, mode, fieldType, isOriginalElement, level, settings, positiveStats, originalPotential } = params;
     if (count <= 0) return [];
 
     const scored = candidates.map(c => {
         const { min } = c.item.getLimit(c.type, fieldType, isOriginalElement, level);
-        const potentialCostPerUnit = c.item.getPotentialCostPerUnit(c.type, fieldType, isOriginalElement);
-        const potentialFreed = -1 * potentialCostPerUnit * min;
+        const potentialFreed = -c.item.calcPotentialCost(c.type, min, 0, fieldType, isOriginalElement);
         const materialCost = c.item.calcMaterialCost(c.type, 0, min, settings);
         return { ...c, min, potentialFreed, materialCost };
     });
+    if (mode === 'material') {
+        scored.sort((a, b) => a.materialCost - b.materialCost);
+        return scored.slice(0, count).map(c => new EnchantStat(c.item, c.type, c.min));
+    }
+    scored.sort((a, b) => b.potentialFreed - a.potentialFreed);
 
-    scored.sort((a, b) => (mode === 'successRate' ? b.potentialFreed - a.potentialFreed : a.materialCost - b.materialCost));
+    const toStats = (set: typeof scored): EnchantStat[] => set.map(c => new EnchantStat(c.item, c.type, c.min));
+    let chosen = scored.slice(0, count);
+    if (originalPotential === null || positiveStats.length === 0 || scored.length <= count) return toStats(chosen);
 
-    return scored.slice(0, count).map(c => new EnchantStat(c.item, c.type, c.min));
+    const evaluate = (set: typeof scored) => {
+        const r = computeEnchantResult({ fieldType, isOriginalElement, originalPotential, positiveStats, negativeStats: toStats(set), settings });
+        return {
+            rate: r.successRate === -1 ? Infinity : r.successRate,
+            expected: r.expectedSuccessRate,
+            freed: set.reduce((sum, c) => sum + c.potentialFreed, 0),
+        };
+    };
+    const better = (x: ReturnType<typeof evaluate>, y: ReturnType<typeof evaluate>): boolean => {
+        if (x.rate !== y.rate) return x.rate > y.rate;
+        if (x.expected !== y.expected) return x.expected > y.expected;
+        return x.freed > y.freed;
+    };
+
+    let best = evaluate(chosen);
+    for (let round = 0; round < 4; round++) {
+        let improved = false;
+        for (let i = 0; i < chosen.length; i++) {
+            for (const cand of scored) {
+                if (chosen.includes(cand)) continue;
+                const trial = chosen.slice();
+                trial[i] = cand;
+                const ev = evaluate(trial);
+                if (better(ev, best)) {
+                    chosen = trial;
+                    best = ev;
+                    improved = true;
+                }
+            }
+        }
+        if (!improved) break;
+    }
+    return toStats(chosen);
 }
 
 export const AUTO_FIND_POTENTIAL_UPPER_LIMIT = 200;

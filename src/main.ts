@@ -287,48 +287,76 @@ async function loadHomeStats() {
     } catch {}
 }
 
+const NOTICE_CACHE_KEY = 'toram-notice-cache-v1';
+const NOTICE_COUNT = 2;
+
+interface NoticeItem { title: string; href: string }
+
+function renderNoticeItems(container: HTMLElement, items: NoticeItem[]): void {
+    container.innerHTML = items.map(item => {
+        const isEvent = item.title.includes('이벤트') || item.title.toLowerCase().includes('event');
+        const cls = isEvent ? 'badge-event' : 'badge-notice';
+        const label = isEvent ? '이벤트' : '공지';
+        const short = item.title.length > 45 ? item.title.slice(0, 45) + '...' : item.title;
+        return `<div class="notice-item"><span class="notice-badge ${cls}">${label}</span><a href="${escapeHtml(item.href)}" target="_blank" class="notice-link">${escapeHtml(short)}</a></div>`;
+    }).join('');
+}
+
+// 공지는 최근 2개만 보여 준다. 저장해 둔 목록을 먼저 바로 보여 주고, 우리 서버 함수와 예비 프록시 3곳에 동시에 요청해 가장 먼저 성공한 결과로 갱신한다.
 async function loadOfficialNotice() {
     const container = document.getElementById('notice-list'); if (!container) return;
     const BASE = 'https://kr.toram.jp';
     const TARGET_URL = `${BASE}/information/?type_code=all`;
-    // 프록시 여러 개 순서대로 시도
+
+    let cachedShown = false;
+    try {
+        const cached = JSON.parse(localStorage.getItem(NOTICE_CACHE_KEY) || 'null') as { items: NoticeItem[] } | null;
+        if (cached?.items?.length) { renderNoticeItems(container, cached.items.slice(0, NOTICE_COUNT)); cachedShown = true; }
+    } catch { /* 저장값이 깨졌으면 무시 */ }
+
     const PROXIES = [
         (u: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
         (u: string) => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
         (u: string) => `https://thingproxy.freeboard.io/fetch/${u}`,
     ];
 
-    for (const makeProxy of PROXIES) {
-        try {
-            const res = await fetch(makeProxy(TARGET_URL), { signal: AbortSignal.timeout(6000) });
-            if (!res.ok) continue;
-            const html = await res.text();
-            if (!html || html.length < 100) continue;
+    // 1순위: 우리 서버(Netlify 함수). 빠르고 안정적이다.
+    const fetchFunction = async (): Promise<NoticeItem[]> => {
+        const res = await fetch('/.netlify/functions/notice', { signal: AbortSignal.timeout(5000) });
+        if (!res.ok) throw new Error(String(res.status));
+        const data = await res.json() as { items?: NoticeItem[] };
+        const items = (data.items ?? []).filter(i => i.title && i.href).slice(0, NOTICE_COUNT);
+        if (items.length === 0) throw new Error('no items');
+        return items;
+    };
 
-            const doc2 = new DOMParser().parseFromString(html, 'text/html');
-            const links = Array.from(doc2.querySelectorAll('a[href*="information_id"]')).slice(0, 5);
-            if (links.length === 0) continue;
-
-            container.innerHTML = links.map(link => {
-                const title = (link.textContent || '').trim().replace(/\s+/g, ' ');
+    const fetchOne = async (makeProxy: (u: string) => string): Promise<NoticeItem[]> => {
+        const res = await fetch(makeProxy(TARGET_URL), { signal: AbortSignal.timeout(5000) });
+        if (!res.ok) throw new Error(String(res.status));
+        const html = await res.text();
+        if (!html || html.length < 100) throw new Error('empty');
+        const doc2 = new DOMParser().parseFromString(html, 'text/html');
+        const items: NoticeItem[] = Array.from(doc2.querySelectorAll('a[href*="information_id"]'))
+            .map(link => {
                 const rawHref = link.getAttribute('href') || '';
-                // href가 절대경로면 그대로, 상대경로면 BASE 붙이기
-                const fullHref = rawHref.startsWith('http')
-                    ? rawHref
-                    : rawHref.startsWith('/')
-                        ? `${BASE}${rawHref}`
-                        : `${BASE}/information/${rawHref}`;
-                const isEvent = title.includes('이벤트') || title.toLowerCase().includes('event');
-                const cls = isEvent ? 'badge-event' : 'badge-notice';
-                const label = isEvent ? '이벤트' : '공지';
-                const short = title.length > 45 ? title.slice(0, 45) + '...' : title;
-                return `<div class="notice-item"><span class="notice-badge ${cls}">${label}</span><a href="${fullHref}" target="_blank" class="notice-link">${short}</a></div>`;
-            }).join('');
-            return; // 성공하면 종료
-        } catch { continue; }
+                const href = rawHref.startsWith('http') ? rawHref : rawHref.startsWith('/') ? `${BASE}${rawHref}` : `${BASE}/information/${rawHref}`;
+                return { title: (link.textContent || '').trim().replace(/\s+/g, ' '), href };
+            })
+            .filter(i => i.title)
+            .slice(0, NOTICE_COUNT);
+        if (items.length === 0) throw new Error('no items');
+        return items;
+    };
+
+    try {
+        // 가장 먼저 성공한 프록시의 결과를 쓴다 (하나씩 기다리지 않는다)
+        const items = await Promise.any([fetchFunction(), ...PROXIES.map(fetchOne)]);
+        renderNoticeItems(container, items);
+        try { localStorage.setItem(NOTICE_CACHE_KEY, JSON.stringify({ at: Date.now(), items })); } catch { /* 저장 불가 환경은 무시 */ }
+    } catch {
+        if (cachedShown) return; // 저장해 둔 공지를 이미 보여 주고 있으면 그대로 둔다
+        container.innerHTML = `<div class="notice-item"><span class="notice-badge badge-notice">공지</span><a href="${TARGET_URL}" target="_blank" class="notice-link">토람 공식 공지 확인하기 →</a></div><div style="font-size:0.75rem;color:var(--text-dim);margin-top:5px;">자동 로드 실패 · 직접 확인해주세요</div>`;
     }
-    // 모든 프록시 실패
-    container.innerHTML = `<div class="notice-item"><span class="notice-badge badge-notice">공지</span><a href="${TARGET_URL}" target="_blank" class="notice-link">토람 공식 공지 확인하기 →</a></div><div style="font-size:0.75rem;color:var(--text-dim);margin-top:5px;">자동 로드 실패 · 직접 확인해주세요</div>`;
 }
 
 async function loadRecentGuides() {

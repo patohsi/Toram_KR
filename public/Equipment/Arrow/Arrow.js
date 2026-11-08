@@ -36,7 +36,7 @@
         },
         {
             category: "무속성",
-            name: "결정 화살",
+            name: "크리스탈 애로우",
             name_en: "Crystal Arrow",
             atk: 115,
             stability: "20%",
@@ -75,7 +75,7 @@
         },
         {
             category: "불속성",
-            name: "화염의 화살",
+            name: "화염의 활",
             name_en: "Flame Arrow",
             atk: 34,
             stability: "20%",
@@ -156,7 +156,7 @@
         },
         {
             category: "땅속성",
-            name: "카카오 에로우",
+            name: "카카오 애로우",
             name_en: "Cacao Arrow",
             atk: 50,
             stability: "20%",

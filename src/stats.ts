@@ -52,7 +52,17 @@ function isDevHost(): boolean {
     return ['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname);
 }
 
-export async function recordPageView(page: string): Promise<void> {
+// 이번 페이지 로드에서 기록 중인(또는 끝난) 요청. 방문자 수를 읽기 전에 이 기록이 끝나길 기다려서,
+// 방금 한 방문이 반영되기 전 값이 보이거나 5분 동안 저장되는 일을 막는다.
+let pendingRecord: Promise<void> | null = null;
+
+export function recordPageView(page: string): Promise<void> {
+    const p = writePageView(page);
+    pendingRecord = p;
+    return p;
+}
+
+async function writePageView(page: string): Promise<void> {
     if (isDevHost()) return;
     if (!/^[a-z]{2,12}$/.test(page)) return;
 
@@ -83,6 +93,15 @@ interface MonthlyDoc { visits?: number; views?: number; pages?: Record<string, n
 export async function loadVisitSummary(): Promise<VisitSummary | null> {
     const day = kstDay();
     const month = day.slice(0, 7);
+
+    // 홈 화면은 그린 직후에 이 함수를 부르고 그 다음에 방문을 기록하므로, 기록 요청이 등록될 때까지 한 박자 기다린다.
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+    if (pendingRecord) {
+        // 방금 한 기록이 반영된 뒤의 값을 읽는다 (저장된 이전 값은 버린다)
+        try { await pendingRecord; } catch { /* 기록 실패와 상관없이 읽기는 시도한다 */ }
+        try { sessionStorage.removeItem(CACHE_KEY); } catch { /* 무시 */ }
+        pendingRecord = null;
+    }
 
     try {
         const cached = JSON.parse(readSession(CACHE_KEY) || 'null') as { at: number; day: string; data: VisitSummary } | null;

@@ -83,7 +83,12 @@ export function itemKey(cat: string, item: EquipItem): string {
 export async function findByKey(key: string): Promise<{ cat: string; item: EquipItem } | null> {
     const cat = key.split('|')[0];
     const list = await loadCategory(cat);
-    const item = list.find(i => itemKey(cat, i) === key);
+    let item = list.find(i => itemKey(cat, i) === key);
+    if (!item) {
+        // 장비 한글 이름이 공식 이름으로 바뀌었어도 예전에 저장한 선택이 풀리지 않도록 영문명으로 한 번 더 찾는다.
+        const en = key.split('|')[2] ?? '';
+        if (en) item = list.find(i => (i.name_en ?? '') === en);
+    }
     return item ? { cat, item } : null;
 }
 

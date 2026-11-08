@@ -1,4 +1,4 @@
-// 계산기: 스테이터스 / 장비 / 스킬 / 옵션부여 탭을 한 페이지 안에서 전환한다.
+// 계산기: 스테이터스(장비 포함) / 스킬 / 옵션부여 탭을 한 페이지 안에서 전환한다.
 import { renderEnchantPage } from '../enchant/ui';
 import { computeTotals, fmtFlat, fmtPct, renderEquipTab } from './equip';
 import { renderSkillTab } from './skills';
@@ -7,11 +7,10 @@ import {
     clampLevel, clampStat, loadBuild, minOf, pointBreakdown, saveBuild, spentPoints,
 } from './state';
 
-export type CalcTab = 'status' | 'equip' | 'skill' | 'enchant';
+export type CalcTab = 'status' | 'skill' | 'enchant';
 
 const TABS: { key: CalcTab; label: string }[] = [
-    { key: 'status', label: '스테이터스' },
-    { key: 'equip', label: '장비' },
+    { key: 'status', label: '스테이터스 · 장비' },
     { key: 'skill', label: '스킬' },
     { key: 'enchant', label: '옵션부여' },
 ];
@@ -53,13 +52,18 @@ export function renderCalculatorPage(tab: CalcTab = 'status'): void {
 
 function renderBody(): void {
     const body = document.getElementById('calc-body')!;
-    if (activeTab === 'status') return renderStatusTab(body);
+    if (activeTab === 'status') {
+        // 스테이터스와 장비를 한 화면에 둔다. 장비를 바꾸면 위의 최종 스테이터스가 바로 다시 계산된다.
+        body.innerHTML = '<div id="calc-status-part"></div><div id="calc-equip-part" style="margin-top:14px;"></div>';
+        const refreshFinal = renderStatusTab(document.getElementById('calc-status-part')!);
+        renderEquipTab(document.getElementById('calc-equip-part')!, build, () => { saveBuild(build); refreshFinal(); });
+        return;
+    }
     if (activeTab === 'enchant') {
         body.innerHTML = '<div id="calc-enchant-host"></div>';
         void renderEnchantPage(document.getElementById('calc-enchant-host')!);
         return;
     }
-    if (activeTab === 'equip') return renderEquipTab(body, build, () => saveBuild(build));
     void renderSkillTab(body, build, () => saveBuild(build));
 }
 
@@ -70,7 +74,7 @@ function pointsText(): { total: number; spent: number; left: number } {
     return { total, spent, left: total - spent };
 }
 
-function renderStatusTab(body: HTMLElement): void {
+function renderStatusTab(body: HTMLElement): () => void {
     const bd = pointBreakdown(build.level, build.highestLevel);
     body.innerHTML = `
     <div class="calc-grid">
@@ -198,4 +202,5 @@ function renderStatusTab(body: HTMLElement): void {
     });
 
     refresh();
+    return () => { void renderFinal(); };
 }

@@ -486,6 +486,8 @@ function renderCrystaPage() {
           <button class="opt-btn" data-val="시전속도%">시전%</button>
           <button class="opt-btn" data-val="행동속도%">행동%</button>
           <button class="opt-btn" data-val="안정률%">안정률</button>
+          <button class="opt-btn" data-val="물리관통%">물관%</button>
+          <button class="opt-btn" data-val="마법관통%">마관%</button>
           <button class="opt-btn" data-val="명중%">명중%</button>
           <button class="opt-btn" data-val="명중">명중</button>
           <button class="opt-btn" data-val="절대명중%">절명%</button>
@@ -550,12 +552,23 @@ function renderCrystaPage() {
     document.getElementById('randomButton')?.addEventListener('click', performRandomPick);
 
     // 옵션 버튼 그룹 이벤트
+    // 여러 개를 동시에 선택할 수 있다 (선택한 옵션을 모두 가진 크리스타만 표시). '전체'를 누르면 선택이 모두 풀린다.
     document.querySelectorAll('.opt-btn').forEach(btn => {
         btn.addEventListener('click', () => {
-            document.querySelectorAll('.opt-btn').forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
             const val = (btn as HTMLElement).dataset.val || 'none';
-            (document.getElementById('optionType') as HTMLInputElement).value = val;
+            const all = document.querySelector('.opt-btn[data-val="none"]')!;
+            if (val === 'none') {
+                document.querySelectorAll('.opt-btn').forEach(b => b.classList.remove('active'));
+                all.classList.add('active');
+            } else {
+                btn.classList.toggle('active');
+                all.classList.remove('active');
+                if (!document.querySelector('.opt-btn.active')) all.classList.add('active');
+            }
+            const picked = Array.from(document.querySelectorAll('.opt-btn.active'))
+                .map(b => (b as HTMLElement).dataset.val || 'none')
+                .filter(v => v !== 'none');
+            (document.getElementById('optionType') as HTMLInputElement).value = picked.length ? picked.join('|') : 'none';
             performSearch();
         });
     });
@@ -580,6 +593,30 @@ const imageMap: Record<string, string> = {
 
 // JSON 데이터 캐싱 (매번 fetch 안 하도록)
 let crystaCache: Record<string, any[]> = {};
+
+// 크리스타 옵션 문자열이 선택한 옵션(예: ATK%, 크리티컬률)과 수치 조건을 만족하는지
+function matchCrystaOption(optionText: string, optionType: string, symbol: string, value: number): boolean {
+    const base = optionType.replace('%', '');
+    if (!optionText.includes(base)) return false;
+    const stats = optionText.split(/\n|&|,/);
+    return stats.some((statStr: string) => {
+        if (!statStr.includes(base)) return false;
+        // % 여부 체크
+        if (statStr.includes('%') !== optionType.includes('%')) return false;
+        // 수치 비교 (값이 입력되었을 때만)
+        if (!isNaN(value)) {
+            const numMatch = statStr.match(/-?\d+(\.\d+)?/);
+            if (!numMatch) return false;
+            const num = parseFloat(numMatch[0]);
+            if (symbol === '=') return num === value;
+            if (symbol === '>') return num > value;
+            if (symbol === '<') return num < value;
+            if (symbol === '>=') return num >= value;
+            if (symbol === '<=') return num <= value;
+        }
+        return true;
+    });
+}
 
 async function performSearch() {
     const nameQuery = (document.getElementById('nameInput') as HTMLInputElement).value.toLowerCase();
@@ -625,42 +662,10 @@ async function performSearch() {
             // 1. 이름 검색
             if (nameQuery && !item.name.toLowerCase().includes(nameQuery)) return false;
 
-            // 2. 옵션 검색
+            // 2. 옵션 검색 (선택한 옵션을 모두 가져야 함)
             if (optionType !== 'none') {
-                // 옵션 문자열 분석 (예: "ATK+5%")
-                // 정규식: 옵션명 뒤에 숫자가 오는지 확인
-                // 주의: STR 검색 시 STR%가 걸리지 않도록 처리해야 함
-
-                // 옵션 텍스트에 해당 옵션명이 있는지 확인
-                if (!item.option.includes(optionType.replace('%', ''))) return false;
-
-                // 정확한 매칭을 위해 파싱 (간이 파싱)
-                // 옵션 문자열을 줄바꿈이나 쉼표로 분리해서 확인
-                const stats = item.option.split(/\n|&|,/);
-                const match = stats.some((statStr: string) => {
-                    if (!statStr.includes(optionType.replace('%', ''))) return false;
-
-                    // % 여부 체크
-                    const hasPercent = statStr.includes('%');
-                    const targetHasPercent = optionType.includes('%');
-                    if (hasPercent !== targetHasPercent) return false;
-
-                    // 수치 비교 (값이 입력되었을 때만)
-                    if (!isNaN(value)) {
-                        const numMatch = statStr.match(/-?\d+(\.\d+)?/);
-                        if (!numMatch) return false;
-                        const num = parseFloat(numMatch[0]);
-
-                        if (symbol === '=') return num === value;
-                        if (symbol === '>') return num > value;
-                        if (symbol === '<') return num < value;
-                        if (symbol === '>=') return num >= value;
-                        if (symbol === '<=') return num <= value;
-                    }
-                    return true;
-                });
-
-                if (!match) return false;
+                const wanted = optionType.split('|');
+                if (!wanted.every(opt => matchCrystaOption(item.option, opt, symbol, value))) return false;
             }
             return true;
         });

@@ -877,7 +877,11 @@ function renderResultStepHtml(waiting = false): string {
         <div class="pz-tile"><span>표기 성공률</span><b>${successLabel}</b></div>
         <div class="pz-tile"><span>성공 기대</span><b>${expectedLabel}</b></div>
       </div>
-      ${result && !waiting && result.insufficientPotential ? '<div class="pz-warning">⚠️ 잠재력이 부족한 순서가 포함되어 있습니다. 잠재력을 늘리거나 옵션 수를 줄여보세요.</div>' : ''}
+      ${result && !waiting && result.insufficientPotential
+          ? (result.lineLimitHit
+              ? '<div class="pz-warning">⚠️ 옵션 8칸이 가득 차면 부여가 바로 끝납니다. 8번째 옵션은 마지막 단계에서 처음 넣도록 순서를 바꿔 주세요.</div>'
+              : '<div class="pz-warning">⚠️ 잠재력이 0 이하가 되는 단계 뒤에는 부여가 끝나서, 그 뒤 순서는 진행할 수 없습니다. 잠재력을 늘리거나 옵션 수를 줄여보세요.</div>')
+          : ''}
       <div class="pz-split">
         <div class="pz-mats"><h4>소모 소재</h4>${materialsHtml}</div>
         <div class="pz-steps">

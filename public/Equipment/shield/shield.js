@@ -93,6 +93,8 @@
         { name: "쿠벨실드", stats: ["guard회복+20%", "guard력+40%", "MATK+2%","행동속도+4%","불내성+15%", "어둠내성+15%"], image: "쿠벨실드.jpg" },
         { name: "메이플의 방패", name_en: "Maple Shield", image: "메이플의 방패.png" },
         { name: "블루 로즈 밴드", stats: ["DEF(75)", "트래이드 불능", "Avoid회복+15%", "무기 ATK+15%", "마법관통+10%", "시전속도+15%", "땅내성+15%"], image: "블루로즈밴드.jpg" },
-        { name: "로렐 실트", stats: ["DEF:129", "Guard회복+23%", "Guard력+40%", "공격속도+10%", "어그로+15%"], image: "로렐실트.jpg" }
+        { name: "로렐 실트", stats: ["DEF:129", "Guard회복+23%", "Guard력+40%", "공격속도+10%", "어그로+15%"], image: "로렐실트.jpg" },
+        { name: "커다란 고양이 쿠키", name_en: "Big Cat Cookie", stats: ["DEF:153", "Guard회복+35%", "Avoid회복+25%", "ATK+2%", "행동속도+4%", "불내성+15%", "빛내성+15%"], image: "커다란 고양이 쿠키.jpg" },
+        { name: "은의 방패(Bemmo)", name_en: "Silver Shield", stats: ["DEF:100", "Guard회복+25%", "Guard력+25%", "최대HP+100000", "복귀단축+25%", "무내성+25%"], drop: "BeMMO 채널 구독자 10만 명 달성 기념 한정 장비" }
     ]
 };

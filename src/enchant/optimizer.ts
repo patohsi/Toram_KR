@@ -1,12 +1,19 @@
 // src/enchant/optimizer.ts
 // 정옵션/마이너스옵션이 정해졌을 때 부여 순서를 계산하고,
 // "성공률 우선" 또는 "재료 절약" 기준으로 마이너스옵션을 자동 선택하는 로직.
+//
+// 계산 규칙은 실제 게임을 따라 하는 Coryn Club 스탯팅 시뮬레이터를 기준으로 한다.
+// - 같은 분류의 능력이 장비에 이미 있으면(이번 단계에 같이 넣는 것 포함) 그 분류 개수의 제곱 × 5% 만큼 소모/회수 잠재력이 늘어난다.
+// - 잠재력은 한 번 확정할 때마다 정수로 내림(0 방향)한다.
+// - 옵션 칸(최대 8)이 모두 차거나 잠재력이 0 이하가 되면 그 확정을 끝으로 부여가 끝난다.
+// - 성공률 = trunc(160 + 230 × 남은 잠재력 / 기준 잠재력)
 
 import {
     type CharacterSettings,
     EQUIP_BASE_POTENTIAL_MIN,
     EnchantStat,
     type EquipmentFieldType,
+    MAX_ABILITY_LINES,
     type StatCategoryData,
     type StatItem,
     type StatValueType,
@@ -26,22 +33,100 @@ export interface EnchantResult {
     successRate: number; // -1 이면 "성공률 무제한(항상 성공)"
     expectedSuccessRate: number; // 0~100, 여러 정옵션의 복합 확률까지 반영한 수치
     materialCostByType: number[]; // 길이 6
-    insufficientPotential: boolean;
+    insufficientPotential: boolean; // 마지막 단계 전에 부여가 끝나 버리는 순서 (잠재력 소진 또는 옵션 8칸 가득)
+    lineLimitHit?: boolean; // 위 경우 중 "옵션 8칸이 가득 차서" 끝나는 경우
 }
 
-function realPotentialCost(v: number): number {
-    return v >= 0 ? Math.floor(v) : Math.ceil(v);
+// ---------------------------------------------------------------------------
+// 게임 규칙 시뮬레이터
+// ---------------------------------------------------------------------------
+
+interface Change {
+    stat: EnchantStat;
+    amount: number; // 부호 포함 변화량
 }
 
-/** 한 스텝 안에 같은 카테고리 능력이 여러 개 몰리면 소모 잠재력이 늘어나는 페널티. */
-function calcExtraRateForStats(stats: EnchantStat[]): number {
-    const counts = new Map<StatCategoryData, number>();
-    stats.forEach(s => {
-        const cat = s.item.category;
-        counts.set(cat, (counts.get(cat) ?? 0) + 1);
-    });
-    const base = [...counts.values()].reduce((sum, n) => sum + (n > 1 ? n * n : 0), 20);
-    return base * 5;
+interface ActionOutcome {
+    cost: number; // 소모한 잠재력 (회수면 음수)
+    remaining: number;
+    rawRate: number; // trunc(160 + 230 × 남은 / 기준)
+    lineCount: number;
+    ended: boolean; // 이 확정으로 부여가 끝남
+    lineLimit: boolean;
+}
+
+class LineSim {
+    potential: number;
+    private readonly values = new Map<string, number>();
+    private readonly lines = new Map<string, StatCategoryData>();
+
+    constructor(
+        private readonly original: number,
+        private readonly fieldType: EquipmentFieldType,
+        private readonly isOriginalElement: boolean
+    ) {
+        this.potential = original;
+    }
+
+    valueOf(stat: EnchantStat): number {
+        return this.values.get(stat.statKey) ?? 0;
+    }
+
+    /** 이번 확정 뒤 장비에 있는 모든 옵션 줄의 분류로 계산하는 소모 배율(%). */
+    private penaltyPercent(changes: Change[]): number {
+        const cats = new Map<StatCategoryData, number>();
+        const seen = new Set<string>();
+        this.lines.forEach((cat, key) => {
+            seen.add(key);
+            cats.set(cat, (cats.get(cat) ?? 0) + 1);
+        });
+        changes.forEach(c => {
+            if (seen.has(c.stat.statKey)) return;
+            seen.add(c.stat.statKey);
+            cats.set(c.stat.item.category, (cats.get(c.stat.item.category) ?? 0) + 1);
+        });
+        let percent = 100;
+        cats.forEach(n => {
+            if (n > 1) percent += 5 * n * n;
+        });
+        return percent;
+    }
+
+    private evaluate(changes: Change[]): ActionOutcome {
+        const penalty = this.penaltyPercent(changes);
+        let total = 0; // 소모면 양수 (×100 단위)
+        changes.forEach(c => {
+            const before = this.valueOf(c.stat);
+            const raw = c.stat.item.calcPotentialCost(c.stat.type, c.amount, before, this.fieldType, this.isOriginalElement);
+            const base = raw >= 0 ? Math.floor(raw) : Math.ceil(raw);
+            total += base * penalty;
+        });
+        const used = Math.trunc(total / 100);
+        const cost = used === 0 ? 0 : used;
+        const remaining = this.potential - cost;
+        const denomBase = this.potential >= this.original ? this.potential : this.original;
+        const denom = Math.max(denomBase, EQUIP_BASE_POTENTIAL_MIN);
+        const rawRate = Math.trunc(160 + (230 * remaining) / denom);
+        const lineKeys = new Set<string>(this.lines.keys());
+        changes.forEach(c => lineKeys.add(c.stat.statKey));
+        const lineCount = lineKeys.size;
+        const lineLimit = lineCount >= MAX_ABILITY_LINES;
+        return { cost, remaining, rawRate, lineCount, ended: remaining < 1 || lineLimit, lineLimit };
+    }
+
+    preview(changes: Change[]): ActionOutcome {
+        return this.evaluate(changes);
+    }
+
+    apply(changes: Change[]): ActionOutcome {
+        const outcome = this.evaluate(changes);
+        changes.forEach(c => {
+            this.values.set(c.stat.statKey, this.valueOf(c.stat) + c.amount);
+            this.lines.set(c.stat.statKey, c.stat.item.category);
+        });
+        this.potential = outcome.remaining;
+        return outcome;
+    }
 }
 
 function calcExpectedRate(successRate: number, positiveStatsLength: number, settings: CharacterSettings): number {
@@ -75,15 +160,167 @@ function groupByCategory(stats: EnchantStat[]): EnchantStat[][] {
     return groups.map(g => g.stats);
 }
 
+/** 확정 기록 전체에서 성공률을 구한다. 부여가 끝나는 첫 확정(없으면 마지막 확정)의 성공률을 쓴다. */
+function finalizeResult(params: {
+    steps: EnchantStepResult[];
+    outcomes: ActionOutcome[];
+    originalPotential: number;
+    positiveCount: number;
+    materialCostByType: number[];
+    settings: CharacterSettings;
+}): EnchantResult {
+    const { steps, outcomes, originalPotential, positiveCount, materialCostByType, settings } = params;
+    let endIdx = outcomes.findIndex(o => o.ended);
+    if (endIdx === -1) endIdx = outcomes.length - 1;
+    const end = outcomes[endIdx];
+    const endedEarly = endIdx < outcomes.length - 1;
+    const rawRate = end.rawRate;
+    const successRate = rawRate >= 160 ? -1 : Math.min(100, Math.max(rawRate, 0));
+    const expectedSuccessRate = calcExpectedRate(successRate, positiveCount, settings);
+    return {
+        steps,
+        originalPotential,
+        successRate,
+        expectedSuccessRate,
+        materialCostByType,
+        insufficientPotential: endedEarly,
+        lineLimitHit: endedEarly && end.lineLimit && end.remaining >= 1,
+    };
+}
+
 /**
- * cy's Grimoire의 부여 순서 전략을 최대한 따라간다.
- * 1) 정옵션들을 소모량이 큰 것부터 1씩 "씨앗" 부여한다 (카테고리 중복 페널티를 피하기 위해 개별로).
- * 2) 잠재력이 허락하는 한, 소모량이 적은 능력부터 최대한 채워 넣는다 (top-off). 이 두 단계는
- *    잔여 잠재력이 절대 1 밑으로 떨어지지 않도록만 진행하므로 완전히 안전한 구간이다.
- * 3) 마이너스옵션을 한 번에 일괄 부여한다.
- * 4) 소모 잠재력이 1인 능력 중 아직 다 못 채운 게 있으면 1단위씩 분할 부여로 전환해 위험을 최소화한다.
- * 5) 그래도 남은 값은 전부 마지막 스텝에 몰아서 부여한다 (위험도가 결정되는 마지막 구간).
+ * 부여 순서 계획.
+ * 1) 정옵션을 소모량이 큰 것부터 1씩 "씨앗" 부여하고, 잠재력이 허락하는 한 소모량이 적은 것부터 채운다 (top-off).
+ *    이 구간은 남은 잠재력이 1 밑으로 내려가지 않게만 진행하므로 안전하다.
+ * 2) 마이너스옵션을 한 번에 부여해 잠재력을 돌려받는다.
+ * 3) 소모 잠재력이 1인 능력은 남은 값을 1단위씩 나눠 부여한다.
+ * 4) 남은 값을 마지막 단계에 몰아서 부여한다.
+ * 옵션이 8줄이면 8번째 줄을 만드는 순간 부여가 끝나므로, 정옵션 하나를 골라 "마지막 단계에서 처음 만드는 줄"로 남겨 둔다.
  */
+function planOnce(params: {
+    fieldType: EquipmentFieldType;
+    isOriginalElement: boolean;
+    originalPotential: number;
+    positiveStats: EnchantStat[];
+    negativeStats: EnchantStat[];
+    heldBack: EnchantStat | null;
+    settings: CharacterSettings;
+}): EnchantResult {
+    const { fieldType, isOriginalElement, originalPotential, positiveStats, negativeStats, heldBack, settings } = params;
+    const materialCostByType = calcMaterialCostByType([...negativeStats, ...positiveStats], settings);
+    const newSim = () => new LineSim(originalPotential, fieldType, isOriginalElement);
+
+    const costPerUnit = (stat: EnchantStat) => stat.item.getPotentialCostPerUnit(stat.type, fieldType, isOriginalElement);
+    const signOf = (stat: EnchantStat) => (stat.value > 0 ? 1 : -1);
+
+    const body = positiveStats.filter(s => s !== heldBack);
+    const assigned = new Map<string, number>();
+    body.forEach(s => assigned.set(s.statKey, 0));
+
+    const seedOrder = [...body].sort((a, b) => costPerUnit(b) - costPerUnit(a));
+    const groups = groupByCategory(seedOrder);
+    const groupChanges = (g: EnchantStat[]): Change[] =>
+        g.filter(s => assigned.get(s.statKey) !== 0).map(s => ({ stat: s, amount: assigned.get(s.statKey)! }));
+
+    // 지금 배정으로 그룹을 차례로 확정해도 남은 잠재력이 항상 1 이상인지
+    const safe = (): boolean => {
+        const sim = newSim();
+        for (const g of groups) {
+            const ch = groupChanges(g);
+            if (ch.length === 0) continue;
+            if (sim.apply(ch).remaining < 1) return false;
+        }
+        return true;
+    };
+
+    seedOrder.forEach(stat => {
+        if (Math.abs(stat.value) < 1) return;
+        assigned.set(stat.statKey, signOf(stat));
+        if (!safe()) assigned.set(stat.statKey, 0);
+    });
+
+    const topoffOrder = [...body].sort((a, b) => costPerUnit(a) - costPerUnit(b));
+    let progressed = true;
+    while (progressed) {
+        progressed = false;
+        for (const stat of topoffOrder) {
+            const cur = assigned.get(stat.statKey)!;
+            if (cur === 0 || Math.abs(cur) >= Math.abs(stat.value)) continue;
+            assigned.set(stat.statKey, cur + signOf(stat));
+            if (safe()) progressed = true;
+            else assigned.set(stat.statKey, cur);
+        }
+    }
+
+    // ---- 실제 확정 기록 ----
+    const sim = newSim();
+    const steps: EnchantStepResult[] = [];
+    const outcomes: ActionOutcome[] = [];
+    const shownWith = (stat: EnchantStat, value: number): EnchantStat => {
+        const c = stat.clone();
+        c.value = value;
+        return c;
+    };
+
+    groups.forEach(g => {
+        const ch = groupChanges(g);
+        if (ch.length === 0) return;
+        const o = sim.apply(ch);
+        outcomes.push(o);
+        steps.push({
+            stats: ch.map(c => shownWith(c.stat, c.amount)),
+            type: 'bulk',
+            potentialCost: o.cost,
+            remainingPotential: o.remaining,
+        });
+    });
+
+    if (negativeStats.length > 0) {
+        const o = sim.apply(negativeStats.map(s => ({ stat: s, amount: s.value })));
+        outcomes.push(o);
+        steps.push({ stats: negativeStats, type: 'bulk', potentialCost: o.cost, remainingPotential: o.remaining });
+    }
+
+    // 소모 잠재력 1인 능력의 남은 값은 1단위씩
+    body.forEach(stat => {
+        const cur = assigned.get(stat.statKey)!;
+        if (cur === 0 || cur === stat.value || costPerUnit(stat) !== 1) return;
+        const sign = signOf(stat);
+        let total = 0;
+        let count = 0;
+        let last = sim.potential;
+        for (let v = cur; v !== stat.value; v += sign) {
+            const o = sim.apply([{ stat, amount: sign }]);
+            outcomes.push(o);
+            total += o.cost;
+            last = o.remaining;
+            count++;
+        }
+        assigned.set(stat.statKey, stat.value);
+        steps.push({
+            stats: [stat],
+            type: count > 1 ? 'each' : 'bulk',
+            repeatCount: count,
+            potentialCost: total,
+            remainingPotential: last,
+        });
+    });
+
+    // 남은 값은 전부 마지막 확정으로 (8번째 줄은 여기서 처음 만든다)
+    const leftover: Change[] = [];
+    positiveStats.forEach(stat => {
+        const cur = stat === heldBack ? 0 : (assigned.get(stat.statKey) ?? 0);
+        if (cur !== stat.value) leftover.push({ stat, amount: stat.value - cur });
+    });
+    if (leftover.length > 0) {
+        const o = sim.apply(leftover);
+        outcomes.push(o);
+        steps.push({ stats: leftover.map(c => c.stat), type: 'bulk', potentialCost: o.cost, remainingPotential: o.remaining });
+    }
+
+    return finalizeResult({ steps, outcomes, originalPotential, positiveCount: positiveStats.length, materialCostByType, settings });
+}
+
 export function computeEnchantResult(params: {
     fieldType: EquipmentFieldType;
     isOriginalElement: boolean;
@@ -92,7 +329,7 @@ export function computeEnchantResult(params: {
     negativeStats: EnchantStat[]; // value는 이미 음수(목표값)
     settings: CharacterSettings;
 }): EnchantResult {
-    const { fieldType, isOriginalElement, originalPotential, positiveStats, negativeStats, settings } = params;
+    const { originalPotential, positiveStats, negativeStats, settings } = params;
     const allStats = [...negativeStats, ...positiveStats];
     const materialCostByType = calcMaterialCostByType(allStats, settings);
 
@@ -100,163 +337,29 @@ export function computeEnchantResult(params: {
         return { steps: [], originalPotential, successRate: -1, expectedSuccessRate: 100, materialCostByType, insufficientPotential: false };
     }
 
-    const costPerUnit = (stat: EnchantStat) => stat.item.getPotentialCostPerUnit(stat.type, fieldType, isOriginalElement);
-    const signOf = (stat: EnchantStat) => (stat.value > 0 ? 1 : -1);
-    const costFromZero = (stat: EnchantStat, value: number) => stat.item.calcPotentialCost(stat.type, value, 0, fieldType, isOriginalElement);
-
-    // ---- 1) + 2) 씨앗 부여 + top-off (잔여 잠재력이 1 밑으로 내려가지 않는 한도 내에서만) ----
-    let safeRemaining = originalPotential;
-    const assigned = new Map<string, number>();
-    positiveStats.forEach(stat => assigned.set(stat.statKey, 0));
-
-    const seedOrder = [...positiveStats].sort((a, b) => costPerUnit(b) - costPerUnit(a));
-    seedOrder.forEach(stat => {
-        if (Math.abs(stat.value) < 1) return;
-        const sign = signOf(stat);
-        const cost = stat.item.calcPotentialCost(stat.type, sign, 0, fieldType, isOriginalElement);
-        if (safeRemaining - cost >= 1) {
-            safeRemaining -= cost;
-            assigned.set(stat.statKey, sign);
-        }
-    });
-
-    const topoffOrder = [...positiveStats].sort((a, b) => costPerUnit(a) - costPerUnit(b));
-    let progressed = true;
-    while (progressed) {
-        progressed = false;
-        for (const stat of topoffOrder) {
-            const cur = assigned.get(stat.statKey)!;
-            if (Math.abs(cur) >= Math.abs(stat.value)) continue;
-            const sign = signOf(stat);
-            const cost = stat.item.calcPotentialCost(stat.type, sign, cur, fieldType, isOriginalElement);
-            if (safeRemaining - cost >= 1) {
-                safeRemaining -= cost;
-                assigned.set(stat.statKey, cur + sign);
-                progressed = true;
+    // 옵션이 8줄이면 마지막에 만드는 줄을 어떤 정옵션으로 할지에 따라 성공률이 달라진다. 가장 좋은 것을 고른다.
+    if (allStats.length >= MAX_ABILITY_LINES && positiveStats.length > 0) {
+        let best: EnchantResult | null = null;
+        const rateKey = (r: EnchantResult) => (r.successRate === -1 ? 101 : r.successRate);
+        positiveStats.forEach(held => {
+            const r = planOnce({ ...params, heldBack: held });
+            if (!best) {
+                best = r;
+                return;
             }
-        }
-    }
-
-    // ---- 표시용 스텝 구성 ----
-    const steps: EnchantStepResult[] = [];
-    let cum = originalPotential;
-
-    const seedTopoffStats = seedOrder.filter(stat => assigned.get(stat.statKey) !== 0);
-    groupByCategory(seedTopoffStats).forEach(group => {
-        let cost = 0;
-        group.forEach(stat => (cost += costFromZero(stat, assigned.get(stat.statKey)!)));
-        cum -= cost;
-        // 표시는 이 단계까지 실제로 누적된 값으로 (최종 목표값이 아닐 수 있음)
-        const displayStats = group.map(stat => {
-            const partial = stat.clone();
-            partial.value = assigned.get(stat.statKey)!;
-            return partial;
-        });
-        steps.push({ stats: displayStats, type: 'bulk', potentialCost: cost, remainingPotential: cum });
-    });
-
-    // ---- 3) 마이너스옵션 일괄 부여 ----
-    let negativeBefore = -1;
-    let negativeAfter = -1;
-    if (negativeStats.length > 0) {
-        const extraRate = calcExtraRateForStats(negativeStats);
-        const rawSum = negativeStats.reduce((sum, stat) => sum + costFromZero(stat, stat.value), 0);
-        const cost = realPotentialCost((rawSum * extraRate) / 100);
-        negativeBefore = cum;
-        cum -= cost;
-        negativeAfter = cum;
-        steps.push({ stats: negativeStats, type: 'bulk', potentialCost: cost, remainingPotential: cum });
-    }
-
-    // ---- 4) 소모 잠재력 1인 능력의 잔여분은 1단위씩 분할 부여 ----
-    const eachStepRanges: { before: number; remainders: number[] }[] = [];
-    positiveStats.forEach(stat => {
-        const cur = assigned.get(stat.statKey)!;
-        if (cur === stat.value) return;
-        if (costPerUnit(stat) !== 1) return;
-        const sign = signOf(stat);
-        const before = cum;
-        const remainders: number[] = [];
-        let running = 0;
-        let v = cur;
-        while (v !== stat.value) {
-            const c = stat.item.calcPotentialCost(stat.type, sign, v, fieldType, isOriginalElement);
-            running += c;
-            v += sign;
-            remainders.push(before - running);
-        }
-        cum = before - running;
-        steps.push({
-            stats: [stat],
-            type: remainders.length > 1 ? 'each' : 'bulk',
-            repeatCount: remainders.length,
-            potentialCost: running,
-            remainingPotential: cum,
-        });
-        eachStepRanges.push({ before, remainders });
-        assigned.set(stat.statKey, stat.value);
-    });
-
-    // ---- 5) 남은 값은 전부 마지막 스텝으로 ----
-    const leftoverStats = [
-        ...positiveStats.filter(stat => assigned.get(stat.statKey) !== stat.value),
-    ];
-    let finalBefore = -1;
-    let finalAfter = -1;
-    if (leftoverStats.length > 0) {
-        const extraRate = calcExtraRateForStats(leftoverStats);
-        const rawSum = leftoverStats.reduce((sum, stat) => {
-            const cur = assigned.get(stat.statKey)!;
-            return sum + stat.item.calcPotentialCost(stat.type, stat.value - cur, cur, fieldType, isOriginalElement);
-        }, 0);
-        const cost = realPotentialCost((rawSum * extraRate) / 100);
-        finalBefore = cum;
-        cum -= cost;
-        finalAfter = cum;
-        steps.push({ stats: leftoverStats, type: 'bulk', potentialCost: cost, remainingPotential: cum });
-    }
-
-    // ---- 성공률 계산: 첫 "잔여 잠재력 < 1" 시점을 찾는다 (1~2단계는 항상 안전하도록 구성했으므로 대상에서 제외) ----
-    let rateNumerator = cum;
-    let rateDenominator = originalPotential;
-    let insufficientPotential = false;
-    let found = false;
-
-    if (negativeStats.length > 0 && negativeAfter < 1) {
-        rateNumerator = negativeAfter;
-        rateDenominator = negativeBefore;
-        insufficientPotential = true;
-        found = true;
-    }
-    if (!found) {
-        for (const range of eachStepRanges) {
-            const crossIdx = range.remainders.findIndex(r => r < 1);
-            if (crossIdx !== -1) {
-                rateNumerator = range.remainders[crossIdx];
-                rateDenominator = crossIdx === 0 ? range.before : range.remainders[crossIdx - 1];
-                insufficientPotential = true;
-                found = true;
-                break;
+            if (r.insufficientPotential !== best.insufficientPotential) {
+                if (!r.insufficientPotential) best = r;
+                return;
             }
-        }
+            if (rateKey(r) !== rateKey(best)) {
+                if (rateKey(r) > rateKey(best)) best = r;
+                return;
+            }
+            if (r.expectedSuccessRate > best.expectedSuccessRate) best = r;
+        });
+        return best!;
     }
-    if (!found && leftoverStats.length > 0) {
-        // 마지막 스텝이므로 잔여 잠재력이 음수여도 위험 플래그는 세우지 않는다 (정상적인 마지막 조작).
-        rateNumerator = finalAfter;
-        rateDenominator = finalBefore;
-    }
-    if (!found && leftoverStats.length === 0 && eachStepRanges.length === 0 && negativeStats.length === 0) {
-        // 정옵션만 있고 전부 씨앗+top-off로 끝난 경우: 마지막 안전 스텝이 곧 마지막 스텝
-        rateNumerator = cum;
-        rateDenominator = steps.length > 1 ? (steps[steps.length - 2]?.remainingPotential ?? originalPotential) : originalPotential;
-    }
-
-    const denom = Math.max(rateDenominator, EQUIP_BASE_POTENTIAL_MIN);
-    const rawRate = 160 + (rateNumerator * 230) / denom;
-    const successRate = rawRate >= 160 ? -1 : Math.max(rawRate, 0);
-    const expectedSuccessRate = calcExpectedRate(successRate, positiveStats.length, settings);
-
-    return { steps, originalPotential, successRate, expectedSuccessRate, materialCostByType, insufficientPotential };
+    return planOnce({ ...params, heldBack: null });
 }
 
 export interface ManualPlacedStep {
@@ -288,44 +391,33 @@ export function computeManualOrderResult(params: {
         return { steps: [], originalPotential, successRate: -1, expectedSuccessRate: 100, materialCostByType, insufficientPotential: false };
     }
 
-    const cumulative = new Map<string, number>();
+    const sim = new LineSim(originalPotential, fieldType, isOriginalElement);
     const steps: EnchantStepResult[] = [];
-    let remaining = originalPotential;
-    const remainders: number[] = [];
+    const outcomes: ActionOutcome[] = [];
 
     orderedSteps.forEach(placed => {
         if (placed.members && placed.members.length > 1) {
-            // 묶음 단계: 자동 계산과 같은 식(같은 분류가 몰리면 소모가 늘어남)으로 한 번에 계산한다.
-            const extraRate = calcExtraRateForStats(placed.members.map(m => m.stat));
-            let raw = 0;
-            const displays: EnchantStat[] = [];
-            placed.members.forEach(m => {
-                const before = cumulative.get(m.stat.statKey) ?? 0;
-                raw += m.stat.item.calcPotentialCost(m.stat.type, m.amount, before, fieldType, isOriginalElement);
-                cumulative.set(m.stat.statKey, before + m.amount);
+            const displays = placed.members.map(m => {
                 const shown = m.stat.clone();
-                shown.value = before + m.amount;
-                displays.push(shown);
+                shown.value = sim.valueOf(m.stat) + m.amount;
+                return shown;
             });
-            const cost = realPotentialCost((raw * extraRate) / 100);
-            remaining -= cost;
-            remainders.push(remaining);
-            steps.push({ stats: displays, type: 'bulk', potentialCost: cost, remainingPotential: remaining });
+            const o = sim.apply(placed.members.map(m => ({ stat: m.stat, amount: m.amount })));
+            outcomes.push(o);
+            steps.push({ stats: displays, type: 'bulk', potentialCost: o.cost, remainingPotential: o.remaining });
             return;
         }
         const repeat = Math.max(1, placed.repeat ?? 1);
         let totalCost = 0;
+        let remaining = sim.potential;
         for (let r = 0; r < repeat; r++) {
-            const before = cumulative.get(placed.stat.statKey) ?? 0;
-            const cost = placed.stat.item.calcPotentialCost(placed.stat.type, placed.amount, before, fieldType, isOriginalElement);
-            cumulative.set(placed.stat.statKey, before + placed.amount);
-            remaining -= cost;
-            totalCost += cost;
-            remainders.push(remaining);
+            const o = sim.apply([{ stat: placed.stat, amount: placed.amount }]);
+            outcomes.push(o);
+            totalCost += o.cost;
+            remaining = o.remaining;
         }
-
         const displayStat = placed.stat.clone();
-        displayStat.value = cumulative.get(placed.stat.statKey)!;
+        displayStat.value = sim.valueOf(placed.stat);
         steps.push({
             stats: [displayStat],
             type: repeat > 1 ? 'each' : 'bulk',
@@ -335,23 +427,7 @@ export function computeManualOrderResult(params: {
         });
     });
 
-    let crossIdx = remainders.length - 1;
-    for (let k = 0; k < remainders.length; k++) {
-        if (remainders[k] < 1) {
-            crossIdx = k;
-            break;
-        }
-    }
-    const insufficientPotential = crossIdx !== remainders.length - 1;
-    const lastRemaining = remainders[crossIdx];
-    const beforeLastRemaining = crossIdx > 0 ? remainders[crossIdx - 1] : originalPotential;
-    const denom = Math.max(beforeLastRemaining, EQUIP_BASE_POTENTIAL_MIN);
-
-    const rawRate = 160 + (lastRemaining * 230) / denom;
-    const successRate = rawRate >= 160 ? -1 : Math.max(rawRate, 0);
-    const expectedSuccessRate = calcExpectedRate(successRate, positiveStatsCount, settings);
-
-    return { steps, originalPotential, successRate, expectedSuccessRate, materialCostByType, insufficientPotential };
+    return finalizeResult({ steps, outcomes, originalPotential, positiveCount: positiveStatsCount, materialCostByType, settings });
 }
 
 export interface NegativeCandidate {
@@ -401,12 +477,14 @@ export function autoSelectNegativeStats(params: {
     const evaluate = (set: typeof scored) => {
         const r = computeEnchantResult({ fieldType, isOriginalElement, originalPotential, positiveStats, negativeStats: toStats(set), settings });
         return {
+            ok: !r.insufficientPotential,
             rate: r.successRate === -1 ? Infinity : r.successRate,
             expected: r.expectedSuccessRate,
             freed: set.reduce((sum, c) => sum + c.potentialFreed, 0),
         };
     };
     const better = (x: ReturnType<typeof evaluate>, y: ReturnType<typeof evaluate>): boolean => {
+        if (x.ok !== y.ok) return x.ok;
         if (x.rate !== y.rate) return x.rate > y.rate;
         if (x.expected !== y.expected) return x.expected > y.expected;
         return x.freed > y.freed;
@@ -443,18 +521,19 @@ export function findMinimumPotential(params: {
     negativeStats: EnchantStat[];
     settings: CharacterSettings;
 }): number {
-    const evalAt = (pot: number) => computeEnchantResult({ ...params, originalPotential: pot }).successRate;
+    const evalAt = (pot: number) => {
+        const r = computeEnchantResult({ ...params, originalPotential: pot });
+        return !r.insufficientPotential && (r.successRate === -1 || r.successRate >= 100);
+    };
 
     let lo = 1;
     let hi = AUTO_FIND_POTENTIAL_UPPER_LIMIT;
-    const rateAtHi = evalAt(hi);
-    if (!(rateAtHi === -1 || rateAtHi >= 100)) {
+    if (!evalAt(hi)) {
         return hi;
     }
     while (hi - lo > 1) {
         const mid = Math.floor((lo + hi) / 2);
-        const rate = evalAt(mid);
-        if (rate === -1 || rate >= 100) {
+        if (evalAt(mid)) {
             hi = mid;
         } else {
             lo = mid;

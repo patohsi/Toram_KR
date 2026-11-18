@@ -3286,3 +3286,5 @@ body.dark-mode .enc-plaza { --pz-warn: #ff7d7d; --pz-ok: #6fd39b; }
 
 .enc-plaza .enc-count-value { min-width: 22px; text-align: center; font-weight: 700; color: var(--pz-accent); }
 .enc-plaza .enc-choice-row { align-items: center; }
+
+.gallery-caption { margin: 2px 0 0; text-align: center; font-size: 0.88rem; color: var(--text-dim); letter-spacing: 0.02em; line-height: 1.5; }

@@ -81,7 +81,7 @@ const eventSchedule = [
 // =================================================
 const HOME_SLIDE_IMAGES: string[] = [
     'HomeImg/slide_01.png','HomeImg/slide_02.png','HomeImg/slide_03.png',
-    'HomeImg/slide_04.png','HomeImg/slide_05.png','HomeImg/slide_06.png',
+    'HomeImg/slide_04.png','HomeImg/slide_05.webp','HomeImg/slide_05.png','HomeImg/slide_06.png',
     'HomeImg/slide_07.png','HomeImg/slide_08.png','HomeImg/slide_09.png','HomeImg/slide_10.png',
 ];
 let slideTimer: ReturnType<typeof setInterval> | null = null;
@@ -175,6 +175,7 @@ function renderHomePage() {
           <div class="img-slider-wrap">
             <div class="img-slider" id="home-slider"><div class="slider-placeholder">public/HomeImg/ 폴더에 slide_01.png ~ slide_10.png 를 넣어주세요</div></div>
             <div class="slider-dots" id="slider-dots"></div>
+            <p class="gallery-caption">다같이 떠들던 소피아</p>
           </div>
         </section>
       </div>

@@ -175,7 +175,7 @@ function renderHomePage() {
           <div class="img-slider-wrap">
             <div class="img-slider" id="home-slider"><div class="slider-placeholder">public/HomeImg/ 폴더에 slide_01.png ~ slide_10.png 를 넣어주세요</div></div>
             <div class="slider-dots" id="slider-dots"></div>
-            <p class="gallery-caption">다같이 떠들던 소피아</p>
+            <p class="gallery-caption">다같이 떠들던 소피아, 그 시절의 우리를 토람은 아직 기억하고 있어요.</p>
           </div>
         </section>
       </div>
